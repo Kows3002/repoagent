@@ -11,7 +11,6 @@ from app.analyzer import (
     read_files,
 )
 from app.ollama_service import analyze_code
-
 from app.code_generator import generate_patch
 from app.patch_service import apply_patch
 from app.git_diff import get_diff
@@ -37,7 +36,7 @@ async def process_job(ctx, job_id: int):
             job.repo_url
         )
 
-        # Save workspace path
+        # Save workspace for approval & git push
         job.workspace_path = repo_folder
         db.commit()
 
@@ -69,7 +68,7 @@ async def process_job(ctx, job_id: int):
         print("\n===== AI ANALYSIS =====", flush=True)
         print(analysis, flush=True)
 
-        # Generate patch and Git diff
+        # Generate patch & diff
         if files:
             target = files[0]
 
@@ -105,6 +104,5 @@ async def process_job(ctx, job_id: int):
             db.commit()
 
     finally:
-        # Keep workspace for approval & Git push
+        # Keep workspace for /approve
         db.close()
-        

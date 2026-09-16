@@ -1,15 +1,11 @@
-import os
-from urllib.parse import urlparse
-
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
-from arq import create_pool
-from arq.connections import RedisSettings
 
 from app.database import get_db
 from app.models import Job
 from app.schemas import JobCreate, JobResponse
 from app.git_push_service import commit_and_push
+from app.worker import process_job
 
 router = APIRouter(prefix="/jobs", tags=["Jobs"])
 
@@ -27,27 +23,10 @@ async def create_job(job: JobCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(new_job)
 
-    # Render Redis connection
-    redis_url = os.getenv("REDIS_URL")
+    # Process immediately (No Redis / No Worker)
+    await process_job(None, new_job.id)
 
-    if not redis_url:
-        raise HTTPException(
-            status_code=500,
-            detail="REDIS_URL environment variable not configured"
-        )
-
-    url = urlparse(redis_url)
-
-    redis = await create_pool(
-        RedisSettings(
-            host=url.hostname,
-            port=url.port,
-            password=url.password,
-        )
-    )
-
-    await redis.enqueue_job("process_job", new_job.id)
-
+    db.refresh(new_job)
     return new_job
 
 
