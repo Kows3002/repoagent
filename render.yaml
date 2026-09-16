@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: repoagent-api
+    runtime: python
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+
+  - type: worker
+    name: repoagent-worker
+    runtime: python
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: arq app.worker_settings.WorkerSettings
