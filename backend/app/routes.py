@@ -1,3 +1,6 @@
+import os
+from urllib.parse import urlparse
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from arq import create_pool
@@ -24,7 +27,25 @@ async def create_job(job: JobCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(new_job)
 
-    redis = await create_pool(RedisSettings())
+    # Render Redis connection
+    redis_url = os.getenv("REDIS_URL")
+
+    if not redis_url:
+        raise HTTPException(
+            status_code=500,
+            detail="REDIS_URL environment variable not configured"
+        )
+
+    url = urlparse(redis_url)
+
+    redis = await create_pool(
+        RedisSettings(
+            host=url.hostname,
+            port=url.port,
+            password=url.password,
+        )
+    )
+
     await redis.enqueue_job("process_job", new_job.id)
 
     return new_job
@@ -41,7 +62,7 @@ def get_job(job_id: int, db: Session = Depends(get_db)):
     job = db.query(Job).filter(Job.id == job_id).first()
 
     if not job:
-        raise HTTPException(404, "Job not found")
+        raise HTTPException(status_code=404, detail="Job not found")
 
     return job
 
@@ -52,10 +73,10 @@ def approve_job(job_id: int, db: Session = Depends(get_db)):
     job = db.query(Job).filter(Job.id == job_id).first()
 
     if not job:
-        raise HTTPException(404, "Job not found")
+        raise HTTPException(status_code=404, detail="Job not found")
 
     if not job.workspace_path:
-        raise HTTPException(400, "Workspace not found")
+        raise HTTPException(status_code=400, detail="Workspace not found")
 
     result = commit_and_push(job.workspace_path)
 
