@@ -1,43 +1,40 @@
-from ollama import chat
+import os
+import json
+import re
+from groq import Groq
 
+client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 def generate_patch(task: str, filename: str, content: str):
-
     prompt = f"""
-You are an expert React developer.
+Modify ONLY this file.
+
+Return ONLY valid JSON.
+
+{{
+  "filename": "{filename}",
+  "updated_code": "FULL updated file content"
+}}
 
 Task:
 {task}
 
-Edit ONLY this file.
-
-Return ONLY the complete updated source code.
-
-Rules:
-- No explanation
-- No markdown
-- No ``` blocks
-- Return only the code
-
 Current file:
-
 {content}
 """
 
-    response = chat(
-        model="llama3.2:latest",
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
         messages=[
-            {
-                "role": "user",
-                "content": prompt
-            }
+            {"role": "user", "content": prompt}
         ],
-        options={
-            "temperature": 0
-        }
+        temperature=0
     )
 
-    return {
-        "filename": filename,
-        "updated_code": response.message.content.strip()
-    }
+    text = response.choices[0].message.content.strip()
+
+    match = re.search(r"\{[\s\S]*\}", text)
+    if not match:
+        raise Exception(text)
+
+    return json.loads(match.group())

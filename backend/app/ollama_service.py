@@ -1,4 +1,7 @@
-from ollama import chat
+import os
+from groq import Groq
+
+client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 def analyze_code(task: str, project_type: str, files: dict):
     prompt = f"""
@@ -16,18 +19,15 @@ Analyze the repository and explain:
 3. Suggested next steps.
 """
 
-    # Reduce context size for faster inference
     for name, content in files.items():
         prompt += f"\n### {name}\n{content[:1000]}\n"
 
-    response = chat(
-        model="llama3.2:latest",
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
         messages=[
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ]
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0
     )
 
-    return response.message.content
+    return response.choices[0].message.content
