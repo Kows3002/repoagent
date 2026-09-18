@@ -23,7 +23,7 @@ Analyze the repository and explain:
         prompt += f"\n### {name}\n{content[:1000]}\n"
 
     response = client.chat.completions.create(
-        model="llama-3.1-8b-instant",
+        model="llama3-8b-8192",
         messages=[
             {"role": "user", "content": prompt}
         ],
