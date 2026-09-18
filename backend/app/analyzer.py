@@ -4,7 +4,6 @@ from pathlib import Path
 def detect_project_type(repo_path: str):
     path = Path(repo_path)
 
-    # Search entire repository
     if list(path.rglob("package.json")):
         return "React/Node"
 
@@ -22,40 +21,49 @@ def find_relevant_files(repo_path: str, task: str):
     files = []
     task_lower = task.lower()
 
-    # 1. Find the exact file path mentioned in the task
+    # Find exact file mentioned in task
     for file in path.rglob("*"):
         if file.is_file():
             relative = file.relative_to(path).as_posix().lower()
-
             if relative in task_lower:
                 files.append(file)
 
-    # 2. CI/CD workflow support
+    # CI workflow support
     if not files and "ci" in task_lower:
         workflow = path / ".github" / "workflows"
-
         if workflow.exists():
             files.extend(workflow.glob("*.yml"))
 
-    # 3. Fallback important files
+    # Fallback important files
     if not files:
-        for name in ["package.json", "requirements.txt", "pyproject.toml", "README.md"]:
+        for name in [
+            "package.json",
+            "requirements.txt",
+            "pyproject.toml",
+            "README.md",
+        ]:
             files.extend(path.rglob(name))
 
-    return [str(f) for f in files]
+    # Return only files that actually exist
+    return [str(f) for f in files if f.exists()]
 
 
 def read_files(file_paths):
     data = {}
 
     for file in file_paths:
+        path = Path(file)
+
+        if not path.exists():
+            print(f"Skipping missing file: {path}")
+            continue
+
         try:
-            content = Path(file).read_text(
+            data[path.name] = path.read_text(
                 encoding="utf-8",
-                errors="ignore"
+                errors="ignore",
             )
-            data[Path(file).name] = content
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"Error reading {path}: {e}")
 
     return data
