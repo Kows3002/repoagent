@@ -1,8 +1,9 @@
-import os
+origin_url = repo.remotes.origin.url
 
-username = os.getenv("GITHUB_USERNAME")
-token = os.getenv("GITHUB_TOKEN")
-
-repo.git.remote("origin").set_url(
-    f"https://{username}:{token}@github.com/Kows3002/visitor-pass-management-system.git"
+# Convert https://github.com/... into authenticated URL
+auth_url = origin_url.replace(
+    "https://",
+    f"https://{username}:{token}@"
 )
+
+repo.git.remote("set-url", "origin", auth_url)
