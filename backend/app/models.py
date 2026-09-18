@@ -18,7 +18,10 @@ class Job(Base):
     # Path of the cloned repository
     workspace_path = Column(String, nullable=True)
 
+    # Repository details
     repo_url = Column(String)
+    github_token = Column(String, nullable=True)
+
     task = Column(String)
     status = Column(String)
 

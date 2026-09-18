@@ -12,8 +12,10 @@ router = APIRouter(prefix="/jobs", tags=["Jobs"])
 
 @router.post("/", response_model=JobResponse)
 async def create_job(job: JobCreate, db: Session = Depends(get_db)):
+
     new_job = Job(
         repo_url=job.repo_url,
+        github_token=job.github_token,
         task=job.task,
         status="queued"
     )
@@ -22,7 +24,7 @@ async def create_job(job: JobCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(new_job)
 
-    # Process immediately (No Redis / No Worker)
+    # Process immediately
     await process_job(None, new_job.id)
 
     db.refresh(new_job)
@@ -36,6 +38,7 @@ def get_jobs(db: Session = Depends(get_db)):
 
 @router.get("/{job_id}", response_model=JobResponse)
 def get_job(job_id: int, db: Session = Depends(get_db)):
+
     job = db.query(Job).filter(Job.id == job_id).first()
 
     if not job:
@@ -46,6 +49,7 @@ def get_job(job_id: int, db: Session = Depends(get_db)):
 
 @router.post("/{job_id}/approve")
 def approve_job(job_id: int, db: Session = Depends(get_db)):
+
     job = db.query(Job).filter(Job.id == job_id).first()
 
     if not job:
@@ -55,7 +59,10 @@ def approve_job(job_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail="Workspace not found")
 
     try:
-        result = commit_and_push(job.workspace_path)
+        result = commit_and_push(
+            job.workspace_path,
+            job.github_token
+        )
 
         return {
             "message": result,

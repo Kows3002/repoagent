@@ -1,7 +1,9 @@
 from pydantic import BaseModel
 
+
 class JobCreate(BaseModel):
     repo_url: str
+    github_token: str
     task: str
 
 
