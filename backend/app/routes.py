@@ -12,7 +12,6 @@ router = APIRouter(prefix="/jobs", tags=["Jobs"])
 
 @router.post("/", response_model=JobResponse)
 async def create_job(job: JobCreate, db: Session = Depends(get_db)):
-
     new_job = Job(
         repo_url=job.repo_url,
         task=job.task,
@@ -37,7 +36,6 @@ def get_jobs(db: Session = Depends(get_db)):
 
 @router.get("/{job_id}", response_model=JobResponse)
 def get_job(job_id: int, db: Session = Depends(get_db)):
-
     job = db.query(Job).filter(Job.id == job_id).first()
 
     if not job:
@@ -48,7 +46,6 @@ def get_job(job_id: int, db: Session = Depends(get_db)):
 
 @router.post("/{job_id}/approve")
 def approve_job(job_id: int, db: Session = Depends(get_db)):
-
     job = db.query(Job).filter(Job.id == job_id).first()
 
     if not job:
@@ -57,9 +54,16 @@ def approve_job(job_id: int, db: Session = Depends(get_db)):
     if not job.workspace_path:
         raise HTTPException(status_code=400, detail="Workspace not found")
 
-    result = commit_and_push(job.workspace_path)
+    try:
+        result = commit_and_push(job.workspace_path)
 
-    return {
-        "message": result,
-        "job_id": job.id
-    }
+        return {
+            "message": result,
+            "job_id": job.id
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
