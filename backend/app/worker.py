@@ -54,7 +54,7 @@ async def process_job(ctx, job_id: int):
             print(f, flush=True)
 
         # AI Analysis
-        print("\nCalling Ollama...", flush=True)
+        print("\nCalling Groq...", flush=True)
 
         analysis = analyze_code(
             job.task,
@@ -95,14 +95,15 @@ async def process_job(ctx, job_id: int):
 
         print(f"\nCompleted Job {job_id}", flush=True)
 
-    except Exception:
+    except Exception as e:
         print("\n===== ERROR TRACEBACK =====", flush=True)
         traceback.print_exc()
+        print(f"\nERROR: {str(e)}", flush=True)
 
         if "job" in locals() and job:
             job.status = "failed"
+            job.ai_result = f"ERROR: {str(e)}"
             db.commit()
 
     finally:
-        # Keep workspace for /approve
         db.close()
