@@ -1,5 +1,6 @@
 import asyncio
 import traceback
+from pathlib import Path
 
 from app.database import SessionLocal
 from app.models import Job
@@ -72,10 +73,15 @@ async def process_job(ctx, job_id: int):
         if files:
             target = files[0]
 
+            # Linux + Windows compatible relative path
+            relative_path = Path(target).relative_to(
+                Path(repo_folder)
+            ).as_posix()
+
             patch = generate_patch(
                 job.task,
-                target.replace(repo_folder + "\\", ""),
-                contents[target.split("\\")[-1]]
+                relative_path,
+                contents[Path(target).name]
             )
 
             apply_patch(repo_folder, patch)
