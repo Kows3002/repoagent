@@ -1,16 +1,8 @@
-from git import Repo
+import os
 
-def commit_and_push(repo_folder: str):
-    repo = Repo(repo_folder)
+username = os.getenv("GITHUB_USERNAME")
+token = os.getenv("GITHUB_TOKEN")
 
-    repo.git.add(A=True)
-
-    if not repo.is_dirty(untracked_files=True):
-        return "No changes to push"
-
-    repo.index.commit("AI: Apply approved code changes")
-
-    origin = repo.remote("origin")
-    origin.push()
-
-    return "Changes pushed successfully"
+repo.git.remote("origin").set_url(
+    f"https://{username}:{token}@github.com/Kows3002/visitor-pass-management-system.git"
+)
