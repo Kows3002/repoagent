@@ -20,7 +20,7 @@ def commit_and_push(workspace_path: str, token: str):
 
     # Commit only if there are changes
     if repo.is_dirty(untracked_files=True):
-        repo.index.commit("AI: Apply requested changes")
+        repo.index.commit("RepoAgent changed the requested files")
 
     # Push to the current branch
     branch = repo.active_branch.name
