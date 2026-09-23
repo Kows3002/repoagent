@@ -1,7 +1,10 @@
 import os
 
+from dotenv import load_dotenv
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, DeclarativeBase
+
+load_dotenv()
 
 # Use Render PostgreSQL if available, otherwise use local SQLite
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./repoagent.db")
