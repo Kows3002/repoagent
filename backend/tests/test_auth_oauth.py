@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import secrets
+import sqlite3
 import time
 import unittest
 from unittest.mock import patch
@@ -19,6 +20,7 @@ from fastapi.testclient import TestClient
 import httpx
 from itsdangerous import TimestampSigner
 from sqlalchemy import create_engine
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -144,6 +146,87 @@ class OAuthAndOwnershipTests(unittest.TestCase):
             response = self.client.get("/auth/github/callback", params={"code": "code", "state": state})
         self.assertIn("auth_error=invalid_state", response.headers["location"])
         exchange.assert_not_called()
+
+    def test_existing_session_cannot_replace_missing_oauth_flow_cookie(self):
+        self._set_session(self._seed_user())
+        self.assertTrue(self.client.get("/auth/session").json()["authenticated"])
+        state = self._begin_login()
+        self.client.cookies.delete(auth.FLOW_COOKIE)
+        self.assertIsNotNone(self.client.cookies.get(auth.SESSION_COOKIE))
+
+        with patch.object(auth.httpx, "post") as exchange, patch.object(auth.httpx, "get") as profile:
+            response = self.client.get("/auth/github/callback", params={
+                "code": "private-authorization-code", "state": state,
+            })
+
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(response.headers["location"], ORIGIN + "/?auth_error=invalid_state")
+        self.assertNotIn("private-authorization-code", response.text + str(response.headers))
+        exchange.assert_not_called()
+        profile.assert_not_called()
+
+    def test_callback_database_lookup_failure_redirects_without_exchanging_code(self):
+        state = self._begin_login()
+
+        def unavailable_database():
+            with self.db_factory() as db:
+                failure = OperationalError("SELECT private_database_detail", {"token": TOKEN},
+                                           sqlite3.OperationalError("private_database_detail"))
+                with patch.object(db, "get", side_effect=failure):
+                    yield db
+
+        with patch.dict(self.app.dependency_overrides, {get_db: unavailable_database}), \
+                patch.object(auth.httpx, "post") as exchange, patch.object(auth.httpx, "get") as profile:
+            response = self.client.get("/auth/github/callback", params={
+                "code": "private-authorization-code", "state": state,
+            })
+
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(response.headers["location"], ORIGIN + "/?auth_error=sign_in_failed")
+        for private_value in ("private_database_detail", TOKEN, "private-authorization-code"):
+            self.assertNotIn(private_value, response.text + str(response.headers))
+        exchange.assert_not_called()
+        profile.assert_not_called()
+
+    def test_callback_commit_failures_redirect_safely_before_and_after_exchange(self):
+        for failed_commit in (1, 2):
+            with self.subTest(failed_commit=failed_commit):
+                state = self._begin_login()
+
+                def unavailable_database():
+                    with self.db_factory() as db:
+                        original_commit = db.commit
+                        count = 0
+
+                        def commit():
+                            nonlocal count
+                            count += 1
+                            if count == failed_commit:
+                                raise OperationalError("COMMIT private_database_detail", {"token": TOKEN},
+                                                       sqlite3.OperationalError("private_database_detail"))
+                            return original_commit()
+
+                        with patch.object(db, "commit", side_effect=commit):
+                            yield db
+
+                with patch.dict(self.app.dependency_overrides, {get_db: unavailable_database}), \
+                        patch.object(auth.httpx, "post") as exchange, patch.object(auth.httpx, "get") as profile:
+                    exchange.return_value = httpx.Response(200, json={"access_token": TOKEN},
+                        request=httpx.Request("POST", "https://github.com/login/oauth/access_token"))
+                    profile.return_value = httpx.Response(200, json=PROFILE)
+                    response = self.client.get("/auth/github/callback", params={
+                        "code": "private-authorization-code", "state": state,
+                    })
+
+                self.assertEqual(response.status_code, 303)
+                self.assertEqual(response.headers["location"], ORIGIN + "/?auth_error=sign_in_failed")
+                for private_value in ("private_database_detail", TOKEN, "private-authorization-code"):
+                    self.assertNotIn(private_value, response.text + str(response.headers))
+                self.assertEqual(exchange.call_count, failed_commit - 1)
+                self.assertEqual(profile.call_count, failed_commit - 1)
+                with self.db_factory() as db:
+                    self.assertEqual(db.query(User).count(), 0)
+                    self.assertEqual(db.query(AuthSession).count(), 0)
 
     def test_expired_state_never_exchanges_code(self):
         state = self._begin_login()

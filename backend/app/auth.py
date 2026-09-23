@@ -15,6 +15,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import RedirectResponse
 import httpx
 from pydantic import BaseModel
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -115,6 +116,14 @@ def _frontend_redirect(error: str | None = None) -> RedirectResponse:
     response.headers["Cache-Control"] = "no-store"
     response.delete_cookie(FLOW_COOKIE, path="/auth", secure=_secure_cookie(), httponly=True, samesite="lax")
     return response
+
+
+def _rollback_oauth_failure(db: Session) -> None:
+    """Keep a failed database connection from masking the safe login redirect."""
+    try:
+        db.rollback()
+    except SQLAlchemyError:
+        pass
 
 
 def _lookup_session(request: Request, db: Session) -> AuthSession | None:
@@ -268,19 +277,23 @@ def github_login(db: Session = Depends(get_db)):
 def github_callback(request: Request, code: str = "", state: str = "", error: str = "", db: Session = Depends(get_db)):
     if not configured():
         return _frontend_redirect("not_configured")
-    if not state or len(state) > 256:
-        return _frontend_redirect("invalid_state")
-    flow = db.get(OAuthFlow, _digest(state))
     nonce = request.cookies.get(FLOW_COOKIE, "")
-    if (flow is None or flow.expires_at <= int(time.time()) or not nonce
-            or not hmac.compare_digest(flow.browser_nonce_hash, _digest(nonce))):
+    # A signed-in session cannot replace the browser-bound OAuth flow cookie.
+    # Reject incomplete callbacks before touching the database or GitHub.
+    if not state or len(state) > 256 or not nonce or len(nonce) > 256:
         return _frontend_redirect("invalid_state")
     try:
+        flow = db.get(OAuthFlow, _digest(state))
+        if (flow is None or flow.expires_at <= int(time.time())
+                or not hmac.compare_digest(flow.browser_nonce_hash, _digest(nonce))):
+            return _frontend_redirect("invalid_state")
         verifier = decrypt_token(flow.verifier_encrypted)
-    except HTTPException:
+        # Consume the one-time state before exchanging the authorization code.
+        db.delete(flow)
+        db.commit()
+    except (HTTPException, SQLAlchemyError):
+        _rollback_oauth_failure(db)
         return _frontend_redirect("sign_in_failed")
-    db.delete(flow)
-    db.commit()
     if error or not code or len(code) > 2048:
         return _frontend_redirect("access_denied" if error == "access_denied" else "sign_in_failed")
     try:
@@ -319,8 +332,8 @@ def github_callback(request: Request, code: str = "", state: str = "", error: st
             db.delete(previous)
         db.add(current)
         db.commit()
-    except (httpx.HTTPError, HTTPException, ValueError, TypeError, KeyError, AttributeError):
-        db.rollback()
+    except (httpx.HTTPError, HTTPException, SQLAlchemyError, ValueError, TypeError, KeyError, AttributeError):
+        _rollback_oauth_failure(db)
         return _frontend_redirect("sign_in_failed")
     response = _frontend_redirect()
     # The signed cookie contains only this opaque identifier, never user data,
