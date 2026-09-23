@@ -5,7 +5,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 
-from app.auth import configured_origins, router as auth_router
+from app.auth import configured_origins, logger as auth_logger, router as auth_router
 from app.database import engine
 from app.migrations import initialize_database
 from app.routes import router
@@ -23,8 +23,8 @@ def create_app() -> FastAPI:
     if len(secret) < 32:
         raise RuntimeError("Set SESSION_SECRET to a persistent random value of at least 32 characters.")
     secure = os.getenv("SESSION_HTTPS_ONLY", "").lower()
-    https_only = secure == "true" if secure else os.getenv("GITHUB_CALLBACK_URL", "").startswith("https://")
-    same_site = os.getenv("SESSION_SAME_SITE", "lax").strip().lower()
+    https_only = secure == "true" if secure else os.getenv("GITHUB_CALLBACK_URL", "").strip().startswith("https://")
+    same_site = os.getenv("SESSION_SAME_SITE", "none" if https_only else "lax").strip().lower()
     if same_site not in {"lax", "none"}:
         raise RuntimeError("SESSION_SAME_SITE must be lax or none.")
     if same_site == "none" and not https_only:
@@ -32,6 +32,8 @@ def create_app() -> FastAPI:
             "SESSION_SAME_SITE=none requires secure cookies. "
             "Set SESSION_HTTPS_ONLY=true and serve the API over HTTPS."
         )
+    auth_logger.info("Session configuration: cookie=repoagent_session secure=%s same_site=%s allowed_origins=%s",
+                     https_only, same_site, sorted(configured_origins()))
     application = FastAPI(title="RepoAgent API", version="1.0.0", lifespan=lifespan)
     application.add_middleware(
         SessionMiddleware,

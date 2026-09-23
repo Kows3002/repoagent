@@ -256,10 +256,10 @@ class OAuthAndOwnershipTests(unittest.TestCase):
         self.assertNotIn("private-detail", str(response.headers))
         self.assertEqual(self.client.get("/auth/me").status_code, 401)
 
-    def test_callback_encrypts_token_and_cookie_contains_only_opaque_identifier(self):
+    def test_callback_encrypts_token_and_cookie_contains_only_identifiers(self):
         response, exchange, profile_request = self._finish_login()
         self.assertEqual(response.headers["location"], ORIGIN + "/")
-        self.assertEqual(set(self._session()), {"session_id"})
+        self.assertEqual(set(self._session()), {"session_id", "user_id"})
         self.assertTrue(exchange.call_args.kwargs["data"]["code_verifier"])
         self.assertEqual(profile_request.call_args.kwargs["headers"]["Authorization"], f"Bearer {TOKEN}")
         with self.db_factory() as db:
@@ -475,6 +475,55 @@ class OAuthAndOwnershipTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "at least 32"):
                 main.create_app()
 
+    def test_local_and_production_urls_come_from_environment(self):
+        for api, frontend in (
+            ("http://127.0.0.1:8000", "http://127.0.0.1:5173"),
+            ("https://repoagent.onrender.com", "https://repoagent-frontend.vercel.app"),
+        ):
+            with self.subTest(api=api), patch.dict(os.environ, {
+                "GITHUB_CALLBACK_URL": api + "/auth/github/callback",
+                "FRONTEND_URL": frontend,
+                "CORS_ORIGINS": "",
+                "GITHUB_CLIENT_ID": "environment-specific-client",
+                "SESSION_HTTPS_ONLY": "true" if api.startswith("https:") else "false",
+            }):
+                app = main.create_app()
+                app.dependency_overrides[get_db] = self.isolated_db
+                with TestClient(app, base_url=api, follow_redirects=False) as client:
+                    login = client.get("/auth/github/login")
+                    self.assertEqual(login.status_code, 302)
+                    query = parse_qs(urlsplit(login.headers["location"]).query)
+                    self.assertEqual(query["client_id"], ["environment-specific-client"])
+                    self.assertEqual(query["redirect_uri"], [api + "/auth/github/callback"])
+                    with patch.object(auth.httpx, "post") as exchange, patch.object(auth.httpx, "get") as profile:
+                        exchange.return_value = httpx.Response(200, json={"access_token": TOKEN},
+                            request=httpx.Request("POST", "https://github.com/login/oauth/access_token"))
+                        profile.return_value = httpx.Response(200, json=PROFILE)
+                        callback = client.get("/auth/github/callback", params={
+                            "code": "test-code", "state": query["state"][0],
+                        })
+                    self.assertEqual(callback.status_code, 303)
+                    self.assertEqual(callback.headers["location"], frontend + "/")
+                    self.assertEqual(exchange.call_args.kwargs["data"]["redirect_uri"], api + "/auth/github/callback")
+                    self.assertTrue(client.get("/auth/session").json()["authenticated"])
+                    self.assertEqual(auth.configured_origins(), {frontend})
+
+    def test_missing_or_invalid_frontend_never_redirects_to_localhost(self):
+        for value in ("", "not-a-url", "[https://example.com](https://example.com)"):
+            with self.subTest(value=value), patch.dict(os.environ, {"FRONTEND_URL": value}):
+                self.assertFalse(auth.configured())
+                response = self.client.get("/auth/github/login")
+                self.assertEqual(response.status_code, 503)
+                self.assertNotIn("location", response.headers)
+                self.assertIn("FRONTEND_URL", response.json()["detail"])
+
+    def test_missing_callback_never_uses_a_local_default(self):
+        with patch.dict(os.environ, {"GITHUB_CALLBACK_URL": "", "FRONTEND_URL": "https://repoagent-frontend.vercel.app"}):
+            self.assertFalse(auth.configured())
+            response = self.client.get("/auth/github/login")
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(response.headers["location"], "https://repoagent-frontend.vercel.app/?auth_error=not_configured")
+
     def test_session_cookie_defaults_to_lax(self):
         with patch.dict(os.environ):
             os.environ.pop("SESSION_SAME_SITE", None)
@@ -491,6 +540,75 @@ class OAuthAndOwnershipTests(unittest.TestCase):
                       if value.startswith(auth.SESSION_COOKIE + "="))
         self.assertIn("samesite=lax", cookie.lower())
         self.assertIn("httponly", cookie.lower())
+
+    def test_production_defaults_preserve_session_on_cross_origin_request(self):
+        api = "https://repoagent.onrender.com"
+        frontend = "https://repoagent-frontend.vercel.app"
+        with patch.dict(os.environ, {
+            "GITHUB_CALLBACK_URL": api + "/auth/github/callback",
+            "FRONTEND_URL": frontend, "CORS_ORIGINS": frontend,
+        }):
+            os.environ.pop("SESSION_SAME_SITE", None)
+            os.environ.pop("SESSION_HTTPS_ONLY", None)
+            app = main.create_app()
+            app.dependency_overrides[get_db] = self.isolated_db
+            with TestClient(app, base_url=api, follow_redirects=False) as client:
+                previous = self.client
+                self.client = client
+                try:
+                    response, _, _ = self._finish_login()
+                    self.assertEqual(response.headers["location"], frontend + "/")
+                    cookie = next(v for v in response.headers.get_list("set-cookie")
+                                  if v.startswith(auth.SESSION_COOKIE + "="))
+                    attributes = {v.strip().lower() for v in cookie.split(";")[1:]}
+                    self.assertTrue({"secure", "httponly", "samesite=none"}.issubset(attributes))
+                    self.assertIn("user_id", self._session())
+                    session = client.get("/auth/session", headers={"Origin": frontend})
+                    self.assertTrue(session.json()["authenticated"])
+                    self.assertEqual(session.headers["access-control-allow-origin"], frontend)
+                    self.assertEqual(session.headers["access-control-allow-credentials"], "true")
+                    client.cookies.clear()
+                    self.assertFalse(client.get("/auth/session", headers={"Origin": frontend}).json()["authenticated"])
+                finally:
+                    self.client = previous
+
+    def test_oauth_stage_logs_never_expose_credentials_or_cookie_values(self):
+        with self.assertLogs(auth.logger, level="INFO") as logs:
+            self._finish_login()
+            self.client.get("/auth/session")
+        output = "\n".join(logs.output)
+        for message in ("OAuth started", "Callback received", "Token exchanged", "User fetched",
+                        "Session created", "Redirect URL", "reason=authenticated"):
+            self.assertIn(message, output)
+        for secret in (TOKEN, SECRET, "oauth-client-secret", "one-time-code", self._session()["session_id"],
+                       self.client.cookies.get(auth.SESSION_COOKIE)):
+            self.assertNotIn(secret, output)
+
+    def test_session_logs_distinguish_missing_unreadable_and_expired_sessions(self):
+        with self.assertLogs(auth.logger, level="INFO") as logs:
+            self.client.get("/auth/session")
+        self.assertIn("reason=cookie_missing", "\n".join(logs.output))
+        self.client.cookies.set(auth.SESSION_COOKIE, "invalid-cookie", domain="127.0.0.1", path="/")
+        with self.assertLogs(auth.logger, level="INFO") as logs:
+            self.client.get("/auth/session")
+        self.assertIn("reason=cookie_invalid_or_expired", "\n".join(logs.output))
+        self._set_session(self._seed_user(), expires_at=int(time.time()) - 1)
+        with self.assertLogs(auth.logger, level="INFO") as logs:
+            self.client.get("/auth/session")
+        self.assertIn("reason=server_session_expired", "\n".join(logs.output))
+
+    def test_session_storage_error_is_not_reported_as_logged_out(self):
+        self._set_session(self._seed_user())
+        def unavailable_db():
+            with self.db_factory() as db:
+                with patch.object(db, "get", side_effect=OperationalError("hidden", {}, Exception("private detail"))):
+                    yield db
+        with patch.dict(self.app.dependency_overrides, {get_db: unavailable_db}), self.assertLogs(auth.logger, level="WARNING") as logs:
+            response = self.client.get("/auth/session")
+        self.assertEqual(response.status_code, 503)
+        self.assertNotIn("authenticated", response.json())
+        self.assertIn("database_unavailable", "\n".join(logs.output))
+        self.assertNotIn("private detail", response.text + "\n".join(logs.output))
 
     def test_cross_site_session_cookie_is_secure_and_oauth_flow_stays_lax(self):
         api_origin = "https://repoagent.onrender.com"

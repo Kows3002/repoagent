@@ -3,6 +3,7 @@
 import base64
 import hashlib
 import hmac
+import logging
 import os
 import re
 import secrets
@@ -24,6 +25,7 @@ from app.models import AuthSession, Job, OAuthFlow, User
 load_dotenv()
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
+logger = logging.getLogger("uvicorn.error.repoagent.auth")
 SESSION_COOKIE = "repoagent_session"
 FLOW_COOKIE = "repoagent_oauth"
 SESSION_SECONDS = 7 * 24 * 60 * 60
@@ -54,9 +56,17 @@ def configured() -> bool:
     return bool(
         os.getenv("GITHUB_CLIENT_ID") and os.getenv("GITHUB_CLIENT_SECRET")
         and len(application_secret()) >= 32
-        and _valid_app_url(os.getenv("GITHUB_CALLBACK_URL", ""))
-        and _valid_app_url(os.getenv("FRONTEND_URL", "http://127.0.0.1:5173"))
+        and _valid_app_url(os.getenv("GITHUB_CALLBACK_URL", "").strip())
+        and _valid_app_url(os.getenv("FRONTEND_URL", "").strip())
     )
+
+
+def _oauth_url(name: str) -> str:
+    """Use the deployment's explicit URL; never fall back to a local address."""
+    value = os.getenv(name, "").strip()
+    if not _valid_app_url(value):
+        raise HTTPException(status_code=503, detail=f"Configure {name} with a valid application URL.")
+    return value
 
 
 def application_secret() -> str:
@@ -65,7 +75,7 @@ def application_secret() -> str:
 
 
 def configured_origins() -> set[str]:
-    candidates = [os.getenv("FRONTEND_URL", "http://127.0.0.1:5173")]
+    candidates = [os.getenv("FRONTEND_URL", "")]
     candidates.extend(os.getenv("CORS_ORIGINS", "").split(","))
     origins = set()
     for candidate in candidates:
@@ -103,13 +113,12 @@ def token_for_job(job: Job) -> str:
 
 def _secure_cookie() -> bool:
     explicit = os.getenv("SESSION_HTTPS_ONLY", "").lower()
-    return explicit == "true" if explicit else os.getenv("GITHUB_CALLBACK_URL", "").startswith("https://")
+    return explicit == "true" if explicit else os.getenv("GITHUB_CALLBACK_URL", "").strip().startswith("https://")
 
 
 def _frontend_redirect(error: str | None = None) -> RedirectResponse:
-    frontend = os.getenv("FRONTEND_URL", "http://127.0.0.1:5173")
-    if not _valid_app_url(frontend):
-        frontend = "http://127.0.0.1:5173"
+    frontend = _oauth_url("FRONTEND_URL")
+    logger.info("Redirect URL: %s outcome=%s", frontend, error or "success")
     parts = urlsplit(frontend)
     query = urlencode({"auth_error": error}) if error else ""
     response = RedirectResponse(urlunsplit((parts.scheme, parts.netloc, parts.path or "/", query, "")), status_code=303)
@@ -129,10 +138,18 @@ def _rollback_oauth_failure(db: Session) -> None:
 def _lookup_session(request: Request, db: Session) -> AuthSession | None:
     cookie = request.session.get("session_id", "")
     if not isinstance(cookie, str) or not cookie or len(cookie) > 256:
+        request.state.auth_session_reason = (
+            "cookie_invalid_or_expired" if request.cookies.get(SESSION_COOKIE) else "cookie_missing"
+        )
         return None
     current = db.get(AuthSession, _digest(cookie))
     if current and current.expires_at > int(time.time()) and current.user is not None:
+        request.state.auth_session_reason = "authenticated"
         return current
+    request.state.auth_session_reason = (
+        "server_session_missing" if current is None else
+        "server_session_expired" if current.expires_at <= int(time.time()) else "user_missing"
+    )
     return None
 
 
@@ -226,7 +243,12 @@ class SessionResponse(BaseModel):
 @router.get("/session", response_model=SessionResponse, response_model_exclude_unset=True)
 def session_status(request: Request, response: Response, db: Session = Depends(get_db)):
     response.headers["Cache-Control"] = "no-store"
-    current = _lookup_session(request, db)
+    try:
+        current = _lookup_session(request, db)
+    except SQLAlchemyError as failure:
+        logger.warning("Session lookup failed: reason=database_unavailable error_type=%s", type(failure).__name__)
+        raise HTTPException(status_code=503, detail="Session storage is unavailable. Please try again.") from None
+    logger.info("Session checked: authenticated=%s reason=%s", bool(current), request.state.auth_session_reason)
     ready = configured()
     if not current:
         return {"authenticated": False, "configured": ready, "user": None}
@@ -251,7 +273,9 @@ def current_user(response: Response, current: AuthSession = Depends(get_current_
 @router.get("/github/login")
 def github_login(db: Session = Depends(get_db)):
     if not configured():
+        logger.warning("OAuth start failed: reason=not_configured")
         return _frontend_redirect("not_configured")
+    logger.info("OAuth started: callback_url=%s", _oauth_url("GITHUB_CALLBACK_URL"))
     state = secrets.token_urlsafe(32)
     nonce = secrets.token_urlsafe(32)
     verifier = secrets.token_urlsafe(64)
@@ -263,7 +287,7 @@ def github_login(db: Session = Depends(get_db)):
                      verifier_encrypted=encrypt_token(verifier), expires_at=now + FLOW_SECONDS))
     db.commit()
     query = urlencode({"client_id": os.environ["GITHUB_CLIENT_ID"],
-                       "redirect_uri": os.environ["GITHUB_CALLBACK_URL"],
+                       "redirect_uri": _oauth_url("GITHUB_CALLBACK_URL"),
                        "scope": "repo read:user", "state": state,
                        "code_challenge": challenge, "code_challenge_method": "S256"})
     response = RedirectResponse("https://github.com/login/oauth/authorize?" + query, status_code=302)
@@ -275,6 +299,8 @@ def github_login(db: Session = Depends(get_db)):
 
 @router.get("/github/callback")
 def github_callback(request: Request, code: str = "", state: str = "", error: str = "", db: Session = Depends(get_db)):
+    logger.info("Callback received: code_present=%s state_present=%s flow_cookie_present=%s provider_error=%s",
+                bool(code), bool(state), bool(request.cookies.get(FLOW_COOKIE)), bool(error))
     if not configured():
         return _frontend_redirect("not_configured")
     nonce = request.cookies.get(FLOW_COOKIE, "")
@@ -291,27 +317,35 @@ def github_callback(request: Request, code: str = "", state: str = "", error: st
         # Consume the one-time state before exchanging the authorization code.
         db.delete(flow)
         db.commit()
-    except (HTTPException, SQLAlchemyError):
+    except (HTTPException, SQLAlchemyError) as failure:
+        logger.warning("OAuth callback failed: stage=state_validation error_type=%s", type(failure).__name__)
         _rollback_oauth_failure(db)
         return _frontend_redirect("sign_in_failed")
     if error or not code or len(code) > 2048:
         return _frontend_redirect("access_denied" if error == "access_denied" else "sign_in_failed")
+    stage = "token_exchange"
     try:
         exchanged = httpx.post(
             "https://github.com/login/oauth/access_token", timeout=20,
             headers={"Accept": "application/json", "User-Agent": "RepoAgent"},
             data={"client_id": os.environ["GITHUB_CLIENT_ID"],
                   "client_secret": os.environ["GITHUB_CLIENT_SECRET"], "code": code,
-                  "redirect_uri": os.environ["GITHUB_CALLBACK_URL"], "code_verifier": verifier},
+                  "redirect_uri": _oauth_url("GITHUB_CALLBACK_URL"), "code_verifier": verifier},
         )
         exchanged.raise_for_status()
         token_data = exchanged.json()
         token = token_data.get("access_token")
         if not isinstance(token, str) or not token or token_data.get("error"):
+            logger.warning("OAuth callback failed: stage=token_exchange reason=invalid_token_response")
             return _frontend_redirect("sign_in_failed")
+        logger.info("Token exchanged")
+        stage = "user_fetch"
         user = github_request("/user", token).json()
         if not isinstance(user.get("id"), int) or not user.get("login"):
+            logger.warning("OAuth callback failed: stage=user_fetch reason=invalid_profile")
             return _frontend_redirect("sign_in_failed")
+        logger.info("User fetched")
+        stage = "session_storage"
         lifetime = min(SESSION_SECONDS, max(1, int(token_data.get("expires_in", SESSION_SECONDS))))
         session_cookie = secrets.token_urlsafe(48)
         account = db.query(User).filter(User.github_id == user["id"]).first()
@@ -332,15 +366,18 @@ def github_callback(request: Request, code: str = "", state: str = "", error: st
             db.delete(previous)
         db.add(current)
         db.commit()
-    except (httpx.HTTPError, HTTPException, SQLAlchemyError, ValueError, TypeError, KeyError, AttributeError):
+        account_id = account.id
+    except (httpx.HTTPError, HTTPException, SQLAlchemyError, ValueError, TypeError, KeyError, AttributeError) as failure:
+        logger.warning("OAuth callback failed: stage=%s error_type=%s", stage, type(failure).__name__)
         _rollback_oauth_failure(db)
         return _frontend_redirect("sign_in_failed")
-    response = _frontend_redirect()
-    # The signed cookie contains only this opaque identifier, never user data,
-    # OAuth credentials, or CSRF state. Expiration/revocation live in the DB.
+    # Only identifiers enter the signed cookie, never OAuth credentials.
+    # The DB session remains authoritative for user lookup, expiry and revocation.
     request.session.clear()
     request.session["session_id"] = session_cookie
-    return response
+    request.session["user_id"] = account_id
+    logger.info("Session created")
+    return _frontend_redirect()
 
 
 @router.post("/logout")

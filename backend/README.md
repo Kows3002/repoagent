@@ -5,7 +5,7 @@ RepoAgent uses GitHub OAuth to connect an account, lists repositories the accoun
 ## Configure GitHub sign-in
 
 1. Register a [GitHub OAuth App](https://github.com/settings/developers).
-2. Set the homepage URL to the browser-visible workspace origin. Register that origin followed by `/auth/github/callback` as the authorization callback. Locally, use `http://127.0.0.1:5173/auth/github/callback`; Vite proxies the callback to the API.
+2. Set the homepage URL to `FRONTEND_URL`. Register the exact `GITHUB_CALLBACK_URL` as the authorization callback. Locally, use `http://127.0.0.1:8000/auth/github/callback`; in production, use `https://repoagent.onrender.com/auth/github/callback`.
 3. Copy `.env.example` to `.env`, enter the OAuth App credentials and Groq key, and generate one persistent application secret.
 
 ```sh
@@ -21,10 +21,10 @@ python -c "import secrets; print(secrets.token_urlsafe(48))"
 | `APP_SECRET` | Optional override for `SESSION_SECRET`; when present it must also contain at least 32 characters. Keep the effective secret identical across API instances. |
 | `GROQ_API_KEY` | Key used by the code editing pipeline. |
 | `DATABASE_URL` | Optional PostgreSQL or SQLite URL; defaults to `sqlite:///./repoagent.db`. |
-| `FRONTEND_URL` | Absolute destination after login; defaults to `http://127.0.0.1:5173`. Also supplies a trusted POST origin and preview frame ancestor. |
+| `FRONTEND_URL` | Required absolute destination after login. Also supplies a trusted POST origin and preview frame ancestor. No localhost fallback. |
 | `CORS_ORIGINS` | Additional comma-separated frontend origins allowed for credentialed requests and POST origin checks. |
 | `SESSION_HTTPS_ONLY` | Optional secure-cookie override; defaults to true for an HTTPS callback and false for local HTTP. |
-| `SESSION_SAME_SITE` | Session cookie policy: `lax` (default) or `none`. `none` requires secure cookies and an HTTPS API. The OAuth flow cookie always uses `lax`. |
+| `SESSION_SAME_SITE` | Defaults to `lax` for HTTP development and `none` with secure cookies for HTTPS. An explicit value overrides the default. The OAuth flow cookie always uses `lax`. |
 
 Install dependencies and start the API from `backend`:
 
@@ -36,6 +36,22 @@ python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
 The API requires an effective secret of at least 32 characters to start. Keep it stable across restarts and deployments. Rotating it invalidates signed sessions and prevents decryption of saved OAuth credentials; users must authorize again. If OAuth credentials are missing, `GET /auth/session` reports `configured: false` and the frontend explains that sign-in is unavailable.
 
 Authorization uses a browser-bound, single-use state and S256 PKCE. It requests GitHub's `repo` and `read:user` scopes. Organization OAuth restrictions and branch protections still apply.
+
+Use the matching pair of URLs for each deployment:
+
+| Environment | `GITHUB_CALLBACK_URL` | `FRONTEND_URL` |
+| --- | --- | --- |
+| Local | `http://127.0.0.1:8000/auth/github/callback` | `http://127.0.0.1:5173` |
+| Production | `https://repoagent.onrender.com/auth/github/callback` | `https://repoagent-frontend.vercel.app` |
+
+Set production values in the Render service environment and register the matching
+callback with GitHub (use separate OAuth Apps for local and production if needed).
+Local `.env` edits do not update Render. Restart or redeploy after environment
+changes, then start a fresh login. An authorization URL containing a local callback
+means the backend that generated it is configured with the local callback value.
+For the production frontend calling Render directly, also set
+`SESSION_SAME_SITE=none` and `SESSION_HTTPS_ONLY=true`; the existing origin checks
+and credentialed CORS use the configured frontend origin.
 
 ## PostgreSQL from a local computer
 
@@ -61,7 +77,27 @@ See [Render's database connection documentation](https://render.com/docs/postgre
 
 ## Sessions and frontend integration
 
-The signed, HttpOnly cookie contains only an opaque random session identifier and defaults to `SameSite=Lax`. Its hashed identifier resolves to a database session with a maximum lifetime of seven days, capped sooner when GitHub returns a shorter token expiry. Public user identity, expiry, and CSRF state live on the server. GitHub access tokens are stored as Fernet ciphertext in `users.access_token` and are never returned by the API.
+The signed, HttpOnly `repoagent_session` cookie contains an opaque session identifier and the internal user ID. The hashed session identifier resolves to the authoritative database session with a maximum lifetime of seven days, capped sooner when GitHub returns a shorter token expiry. HTTP development defaults to `SameSite=Lax`; HTTPS defaults to `SameSite=None; Secure`. Set `SESSION_SAME_SITE=none` in Render if overriding this default. Public user identity, expiry, and CSRF state live on the server. GitHub access tokens are stored as Fernet ciphertext in `users.access_token` and are never returned by the API.
+
+Auth logs use `uvicorn.error.repoagent.auth` and record OAuth start, callback
+receipt, token exchange, user fetch, session creation, and the configured redirect
+URL. They never record codes, tokens, secrets, cookie values, PKCE verifiers, or
+raw exception details. Startup logs show cookie flags and allowed origins.
+Keep `SESSION_SECRET` identical across instances and deployments.
+
+After `Session created`, check the next `Session checked` reason:
+
+- `authenticated`: the signed cookie and database session were accepted.
+- `cookie_missing`: no cookie arrived; check the browser's cookie rejection reason.
+- `cookie_invalid_or_expired`: a cookie arrived but could not be verified; check
+  expiry and whether the signing secret changed between instances.
+- `server_session_missing`, `server_session_expired`, or `user_missing`: the
+  signed cookie was readable but its database session is no longer valid.
+
+Database lookup failures return 503 instead of falsely reporting a logged-out
+user. Callback failures log their stage and exception type. Browsers blocking
+third-party cookies may still omit a `SameSite=None` cookie; use a same-origin
+proxy or custom domains on the same site if the browser reports this restriction.
 
 Every POST requires both a valid `X-CSRF-Token` header and a trusted `Origin` (or a trusted `Referer` origin when Origin is absent). Fetch the token from `GET /auth/session`; keep it in memory and send requests with `credentials: "include"`. The token is an anti-forgery value, not a GitHub credential.
 
