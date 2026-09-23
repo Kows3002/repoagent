@@ -6,7 +6,7 @@ from app.auth import (
 )
 from app.database import get_db
 from app.models import AuthSession, Job
-from app.schemas import JobCreate, JobResponse
+from app.schemas import JobApprove, JobCreate, JobResponse
 from app.git_push_service import GitPushError, commit_and_push
 from app.worker import run_job
 
@@ -57,7 +57,10 @@ def get_job(job_id: int, db: Session = Depends(get_db), current: AuthSession = D
 
 
 @router.post("/{job_id}/approve")
-def approve_job(job_id: int, db: Session = Depends(get_db), current: AuthSession = Depends(require_csrf)):
+def approve_job(
+    job_id: int, db: Session = Depends(get_db), current: AuthSession = Depends(require_csrf),
+    approval: JobApprove | None = None,
+):
     job = get_owned_job(job_id, current, db)
 
     if job.status != "completed":
@@ -76,12 +79,13 @@ def approve_job(job_id: int, db: Session = Depends(get_db), current: AuthSession
         result = commit_and_push(
             job.workspace_path,
             token,
+            (approval or JobApprove()).commit_message,
         )
 
         return {
-            "message": result,
+            "message": result.message,
             "job_id": job.id,
-            "commit_message": "RepoAgent: Apply requested changes",
+            "commit_message": result.commit_message,
         }
 
     except GitPushError as error:

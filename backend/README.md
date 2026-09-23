@@ -146,6 +146,23 @@ Origin: http://127.0.0.1:5173
 
 The API responds with a queued job and runs cloning, analysis, and patch generation in a background thread. Poll `GET /jobs/{id}` for progress. `POST /jobs/{id}/approve` requires a completed job with changes and pushes to the current default branch. Protected branches may reject direct pushes. Each user can list, read, preview, and approve only their own jobs.
 
+Approval accepts an optional JSON body with the commit message edited in the review card. Send the session cookie, trusted Origin, and the same CSRF header as job creation:
+
+```http
+POST /jobs/42/approve
+Content-Type: application/json
+X-CSRF-Token: <value from /auth/session>
+Origin: http://127.0.0.1:5173
+```
+
+```json
+{ "commit_message": "Fix login page title" }
+```
+
+The message is trimmed and must contain 1-200 characters on a single line, without control characters. Invalid messages return 422 before any commit or push. Omitting the body or the field keeps the default `RepoAgent: Apply requested changes`, so older clients remain compatible. A successful response contains `{ "message": "Changes pushed successfully", "job_id": 42, "commit_message": "Fix login page title" }`.
+
+If an earlier push failed after creating the commit, retrying pushes that existing commit without rewriting it. The response always returns its actual message, even if the retry submits a different message. Deploy the backend and frontend updates together; this change needs no database migration or new environment variables.
+
 ## Real UI previews
 
 The worker captures immutable, filtered snapshots immediately after cloning and after applying the patch. Preview builds use those snapshots, so the Current frame represents the original code even after approval. Preview preparation never commits or pushes.

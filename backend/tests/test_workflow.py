@@ -18,6 +18,7 @@ from fastapi.testclient import TestClient
 
 from app import routes, worker
 from app.schemas import JobCreate
+from app.git_push_service import DEFAULT_COMMIT_MESSAGE, PushResult
 
 
 class RoutesTests(unittest.TestCase):
@@ -79,10 +80,59 @@ class RoutesTests(unittest.TestCase):
             push.assert_not_called()
 
     def test_approval_reports_commit_message(self):
-        with patch.object(routes, "commit_and_push", return_value="Changes pushed successfully") as push:
+        with patch.object(routes, "commit_and_push", return_value=PushResult(DEFAULT_COMMIT_MESSAGE)) as push:
             result = routes.approve_job(42, self.db, self.current)
-        push.assert_called_once_with("test-workspace", self.user.access_token)
-        self.assertEqual(result["commit_message"], "RepoAgent: Apply requested changes")
+        push.assert_called_once_with("test-workspace", self.user.access_token, DEFAULT_COMMIT_MESSAGE)
+        self.assertEqual(result["commit_message"], DEFAULT_COMMIT_MESSAGE)
+
+    def approval_client(self):
+        app = FastAPI()
+        app.include_router(routes.router)
+        app.dependency_overrides[routes.get_db] = lambda: self.db
+        app.dependency_overrides[routes.require_csrf] = lambda: self.current
+        return TestClient(app)
+
+    def test_approval_without_body_or_message_uses_default(self):
+        with self.approval_client() as client:
+            for options in ({}, {"json": {}}, {"json": None}):
+                with self.subTest(options=options), patch.object(routes, "commit_and_push", return_value=PushResult(DEFAULT_COMMIT_MESSAGE)) as push:
+                    response = client.post("/jobs/42/approve", **options)
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual(response.json()["commit_message"], DEFAULT_COMMIT_MESSAGE)
+                    push.assert_called_once_with("test-workspace", self.user.access_token, DEFAULT_COMMIT_MESSAGE)
+
+    def test_approval_trims_and_passes_custom_message(self):
+        custom_message = "Fix login title"
+        with self.approval_client() as client, patch.object(routes, "commit_and_push", return_value=PushResult(custom_message)) as push:
+            response = client.post("/jobs/42/approve", json={"commit_message": "  " + custom_message + "  "})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"message": "Changes pushed successfully", "job_id": 42, "commit_message": custom_message})
+        push.assert_called_once_with("test-workspace", self.user.access_token, custom_message)
+
+    def test_approval_reports_actual_message_when_retry_requests_another(self):
+        with self.approval_client() as client, patch.object(routes, "commit_and_push", return_value=PushResult("Previously committed title")) as push:
+            response = client.post("/jobs/42/approve", json={"commit_message": "Different retry title"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["commit_message"], "Previously committed title")
+        push.assert_called_once_with("test-workspace", self.user.access_token, "Different retry title")
+
+    def test_approval_rejects_invalid_messages_before_push(self):
+        invalid_messages = ["", "   ", "x" * 201, "line\nline", "line\r", "line\t", "line\0", "line\x7f", "line\x85", "line\u2028", "line\u2029", 123, None, []]
+        with self.approval_client() as client, patch.object(routes, "commit_and_push") as push:
+            for message in invalid_messages:
+                with self.subTest(message=repr(message)):
+                    response = client.post("/jobs/42/approve", json={"commit_message": message})
+                    self.assertEqual(response.status_code, 422)
+            response = client.post("/jobs/42/approve", json={"commit_message": "Fix title", "branch": "unreviewed"})
+            self.assertEqual(response.status_code, 422)
+            push.assert_not_called()
+
+    def test_approval_accepts_maximum_length_unicode_message(self):
+        message = "\u00e9" * 200
+        with self.approval_client() as client, patch.object(routes, "commit_and_push", return_value=PushResult(message)) as push:
+            response = client.post("/jobs/42/approve", json={"commit_message": message})
+        self.assertEqual(response.status_code, 200)
+        push.assert_called_once_with("test-workspace", self.user.access_token, message)
 
     def test_approval_never_returns_unexpected_exception_text(self):
         with patch.object(routes, "commit_and_push", side_effect=RuntimeError("secret-token in git URL")):

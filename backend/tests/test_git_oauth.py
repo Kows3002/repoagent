@@ -137,7 +137,8 @@ class LocalGitTests(unittest.TestCase):
         (Path(repo.working_tree_dir) / "README.md").write_text("Reviewed change\n", encoding="utf-8")
         with self.local_transport() as calls:
             result = git_push_service.commit_and_push(repo.working_tree_dir, ACCESS_TOKEN)
-        self.assertEqual(result, "Changes pushed successfully")
+        self.assertEqual(result.message, "Changes pushed successfully")
+        self.assertEqual(result.commit_message, "RepoAgent: Apply requested changes")
         self.assertEqual([head.name for head in self.remote.heads], initial_branches)
         self.assertEqual([head.name for head in repo.heads], initial_local_branches)
         self.assertEqual(self.remote.head.commit.message, "RepoAgent: Apply requested changes")
@@ -147,6 +148,32 @@ class LocalGitTests(unittest.TestCase):
         self.assertEqual(push_call[2], {})
         self.assertIn("Authorization: Basic", " ".join(push_call[3].values()))
         self.assert_config_has_no_credentials(repo)
+
+    def test_custom_message_is_written_to_pushed_commit(self):
+        repo = self.clone()
+        (Path(repo.working_tree_dir) / "README.md").write_text("Reviewed change\n", encoding="utf-8")
+        custom_message = "Fix login title and preserve formatting"
+        with self.local_transport():
+            result = git_push_service.commit_and_push(repo.working_tree_dir, ACCESS_TOKEN, custom_message)
+        self.assertEqual(self.remote.head.commit.message, custom_message)
+        self.assertEqual(result.commit_message, custom_message)
+        self.assert_config_has_no_credentials(repo)
+
+    def test_retry_preserves_existing_commit_and_reports_actual_message(self):
+        repo = self.clone()
+        (Path(repo.working_tree_dir) / "README.md").write_text("Reviewed change\n", encoding="utf-8")
+        original_message = "Fix login title"
+        with self.local_transport(RuntimeError("Connection interrupted")), self.assertRaises(git_push_service.GitPushError):
+            git_push_service.commit_and_push(repo.working_tree_dir, ACCESS_TOKEN, original_message)
+        committed_sha = repo.head.commit.hexsha
+        self.assertFalse(repo.is_dirty(untracked_files=True))
+        self.assertEqual(self.remote.head.commit.message, "Initial commit")
+        with self.local_transport():
+            result = git_push_service.commit_and_push(repo.working_tree_dir, ACCESS_TOKEN, "Changed retry message")
+        self.assertEqual(self.remote.head.commit.hexsha, committed_sha)
+        self.assertEqual(result.commit_message, original_message)
+        self.assertEqual(self.remote.head.commit.message, original_message)
+        self.assertEqual(self.remote.git.show("HEAD:README.md").rstrip("\r\n"), "Reviewed change")
 
     def test_concurrent_upstream_commit_rejects_without_force(self):
         repo = self.clone()

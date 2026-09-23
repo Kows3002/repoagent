@@ -26,6 +26,7 @@ from sqlalchemy.pool import StaticPool
 
 from app import auth, main, routes
 from app.database import Base, get_db
+from app.git_push_service import DEFAULT_COMMIT_MESSAGE, PushResult
 from app.models import AuthSession, Job, OAuthFlow, User
 
 SECRET = "isolated-tests-session-secret-at-least-32-characters"
@@ -367,11 +368,11 @@ class OAuthAndOwnershipTests(unittest.TestCase):
         with self.db_factory() as db:
             db.get(User, user_id).access_token = auth.encrypt_token("latest-token")
             db.commit()
-        with patch.object(auth, "github_request", return_value=httpx.Response(200, json=REPOSITORY)) as github, patch.object(routes, "commit_and_push", return_value="Changes pushed successfully") as push:
+        with patch.object(auth, "github_request", return_value=httpx.Response(200, json=REPOSITORY)) as github, patch.object(routes, "commit_and_push", return_value=PushResult(DEFAULT_COMMIT_MESSAGE)) as push:
             response = self.client.post(f"/jobs/{job_id}/approve", headers=self._headers())
         self.assertEqual(response.status_code, 200)
         github.assert_called_once_with("/repos/octocat/project", "latest-token")
-        push.assert_called_once_with("isolated-workspace", "latest-token")
+        push.assert_called_once_with("isolated-workspace", "latest-token", DEFAULT_COMMIT_MESSAGE)
         self.assertNotIn("latest-token", response.text)
 
     def test_mutations_require_both_trusted_origin_and_csrf(self):

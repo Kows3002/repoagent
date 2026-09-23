@@ -1,6 +1,17 @@
+from dataclasses import dataclass
+
 from git import Actor, Repo
 
 from app.git_service import normalize_repo_url, oauth_git_environment
+
+
+DEFAULT_COMMIT_MESSAGE = "RepoAgent: Apply requested changes"
+
+
+@dataclass(frozen=True)
+class PushResult:
+    commit_message: str
+    message: str = "Changes pushed successfully"
 
 
 class GitPushError(RuntimeError):
@@ -24,7 +35,9 @@ def _default_branch(repo: Repo, origin_url: str) -> str:
     return default
 
 
-def commit_and_push(workspace_path: str, access_token: str):
+def commit_and_push(
+    workspace_path: str, access_token: str, commit_message: str = DEFAULT_COMMIT_MESSAGE,
+) -> PushResult:
     repo = None
     try:
         repo = Repo(workspace_path)
@@ -39,7 +52,7 @@ def commit_and_push(workspace_path: str, access_token: str):
         if repo.is_dirty(untracked_files=True):
             identity = Actor("RepoAgent", "repoagent@users.noreply.github.com")
             repo.index.commit(
-                "RepoAgent: Apply requested changes",
+                commit_message,
                 author=identity,
                 committer=identity,
                 skip_hooks=True,
@@ -49,6 +62,9 @@ def commit_and_push(workspace_path: str, access_token: str):
         # refuses concurrent upstream changes; never force, branch, or open a PR.
         with repo.git.custom_environment(**env):
             repo.git.push(origin_url, f"HEAD:refs/heads/{default_branch}")
+        # A retry may push an already-created commit from a failed first attempt.
+        # Report that actual commit instead of echoing a newly submitted message.
+        pushed_message = repo.head.commit.message.rstrip("\r\n")
     except GitPushError:
         raise
     except Exception as error:
@@ -66,4 +82,4 @@ def commit_and_push(workspace_path: str, access_token: str):
         if repo is not None:
             repo.close()
 
-    return "Changes pushed successfully"
+    return PushResult(commit_message=pushed_message)
