@@ -771,6 +771,44 @@ class OAuthAndOwnershipTests(unittest.TestCase):
                 finally:
                     self.client = previous
 
+    def test_preview_origin_requires_explicit_cors_and_csrf_allowlist(self):
+        production = "https://repoagent-frontend.vercel.app"
+        preview = "https://repoagent-frontend-a6yruwwje-kows3002s-projects.vercel.app"
+        unrelated = "https://unrelated-project.vercel.app"
+        owner = self._seed_user()
+        for extra_origins in ("", preview):
+            with self.subTest(extra_origins=extra_origins), patch.dict(os.environ, {
+                "FRONTEND_URL": production, "CORS_ORIGINS": extra_origins,
+            }):
+                app = main.create_app()
+                app.dependency_overrides[get_db] = self.isolated_db
+                with TestClient(app, base_url=ORIGIN, follow_redirects=False) as client:
+                    for origin in (preview, production, unrelated):
+                        allowed = origin == production or origin == extra_origins
+                        with self.subTest(origin=origin, allowed=allowed):
+                            client.cookies.clear()
+                            session = client.get("/auth/session", headers={"Origin": origin})
+                            # HTTP 200 does not make a cross-origin response readable.
+                            # The browser also requires this exact allow-origin header.
+                            self.assertEqual(session.status_code, 200)
+                            self.assertFalse(session.json()["authenticated"])
+                            self.assertEqual(session.headers.get("access-control-allow-origin"), origin if allowed else None)
+                            self.assertEqual(session.headers.get("access-control-allow-credentials"), "true")
+                            preflight = client.options("/auth/logout", headers={
+                                "Origin": origin, "Access-Control-Request-Method": "POST",
+                                "Access-Control-Request-Headers": "X-CSRF-Token",
+                            })
+                            self.assertEqual(preflight.status_code, 200 if allowed else 400)
+                            self.assertEqual(preflight.headers.get("access-control-allow-origin"), origin if allowed else None)
+                            # Even a non-browser client cannot bypass the origin
+                            # boundary by supplying a valid session and CSRF token.
+                            self._set_session(owner)
+                            client.cookies.update(self.client.cookies)
+                            logout = client.post("/auth/logout", headers={
+                                "Origin": origin, "X-CSRF-Token": "test-csrf",
+                            })
+                            self.assertEqual(logout.status_code, 200 if allowed else 403)
+
     def test_oauth_stage_logs_never_expose_credentials_or_cookie_values(self):
         with self.assertLogs(auth.logger, level="INFO") as logs:
             self._finish_login()
