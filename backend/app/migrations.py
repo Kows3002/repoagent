@@ -32,6 +32,17 @@ def initialize_database(engine):
 
         Base.metadata.create_all(bind=connection)
         columns = {column["name"] for column in inspect(connection).get_columns("jobs")}
+        # Existing credentials/sessions remain unbound and require App sign-in.
+        # Do not reinterpret a broad OAuth token as a GitHub App credential.
+        for table, additions in {
+            "users": {"github_app_client_id": "VARCHAR", "github_token_expires_at": "BIGINT"},
+            "auth_sessions": {"github_app_client_id": "VARCHAR"},
+        }.items():
+            existing = {column["name"] for column in inspect(connection).get_columns(table)}
+            for name, column_type in additions.items():
+                if name not in existing:
+                    connection.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {column_type}"))
+
 
         if "user_id" not in columns:
             connection.execute(text(

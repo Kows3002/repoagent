@@ -93,7 +93,6 @@ def approve_job(
                 raise HTTPException(status_code=400, detail="Workspace not found")
 
             # Permissions can change between generation and approval.
-            repository_for_job(job.repo_url, current)
             token = token_for_job(job)
             result = commit_and_push(
                 job.workspace_path,

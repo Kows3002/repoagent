@@ -7,7 +7,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.migrations import initialize_database
-from app.models import ActivityEvent, Job, User
+from app.models import ActivityEvent, AuthSession, Job, User
 
 
 class MigrationTests(unittest.TestCase):
@@ -110,6 +110,22 @@ class MigrationTests(unittest.TestCase):
             self.assertEqual((saved.created_at, saved.updated_at, saved.pushed_at), (100, 200, 200))
             self.assertEqual(saved.commit_message, "Saved title")
             self.assertEqual(db.query(ActivityEvent).one().job_id, 7)
+
+    def test_existing_oauth_credentials_are_preserved_but_not_promoted_to_app_access(self):
+        with self.engine.begin() as connection:
+            connection.exec_driver_sql("CREATE TABLE users (id INTEGER PRIMARY KEY, github_id BIGINT UNIQUE NOT NULL, username VARCHAR NOT NULL, avatar_url VARCHAR, access_token TEXT NOT NULL)")
+            connection.exec_driver_sql("CREATE TABLE auth_sessions (id VARCHAR PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id), name VARCHAR, csrf_token VARCHAR NOT NULL, expires_at INTEGER NOT NULL)")
+            connection.exec_driver_sql("INSERT INTO users VALUES (1, 42, 'octocat', NULL, 'encrypted-old-oauth')")
+            connection.exec_driver_sql("INSERT INTO auth_sessions VALUES ('old-session', 1, NULL, 'csrf', 9999999999)")
+        initialize_database(self.engine)
+        initialize_database(self.engine)
+        with Session(self.engine) as db:
+            user = db.get(User, 1)
+            session = db.get(AuthSession, "old-session")
+            self.assertEqual(user.access_token, "encrypted-old-oauth")
+            self.assertIsNone(user.github_app_client_id)
+            self.assertIsNone(user.github_token_expires_at)
+            self.assertIsNone(session.github_app_client_id)
 
     def test_github_identity_is_unique(self):
         initialize_database(self.engine)

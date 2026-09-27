@@ -1,12 +1,15 @@
 ﻿# RepoAgent backend
 
-RepoAgent uses GitHub OAuth to connect an account, lists repositories the account can push to, and generates focused code changes. Users review the git diff and, for supported projects, real before-and-after UI previews. Explicit approval commits with the editable message (default: `RepoAgent: Apply requested changes`) and pushes directly to the repository's default branch. It does not create a branch or pull request.
+RepoAgent uses a GitHub App to connect an account, lists only repositories authorized for that App where the account can push, and generates focused code changes. Users review the git diff and, for supported projects, real before-and-after UI previews. Explicit approval commits with the editable message (default: `RepoAgent: Apply requested changes`) and pushes directly to the repository's default branch. It does not create a branch or pull request.
 
 ## Configure GitHub sign-in
 
-1. Register a [GitHub OAuth App](https://github.com/settings/developers).
-2. Set the homepage URL to `FRONTEND_URL`. Register the exact `GITHUB_CALLBACK_URL` as the authorization callback. Locally, use `http://127.0.0.1:8000/auth/github/callback`; in production, use `https://repoagent.onrender.com/auth/github/callback`.
-3. Copy `.env.example` to `.env`, enter the OAuth App credentials and Groq key, and generate one persistent application secret.
+1. Open **GitHub > Settings > Developer settings > GitHub Apps > New GitHub App** ([registration](https://github.com/settings/apps/new)). An existing OAuth App cannot provide selected-repository permissions; create a GitHub App for this version.
+2. Set the homepage to your frontend URL. Set **Callback URL** to exactly `https://repoagent.onrender.com/auth/github/callback` in production, or `http://127.0.0.1:8000/auth/github/callback` locally. Set **Setup URL** to your frontend URL so installation can return there.
+3. Leave **Request user authorization (OAuth) during installation** unchecked. RepoAgent starts its own browser-bound authorization from **Continue with GitHub**. Leave user-token expiration enabled. Disable webhooks; this integration does not require a webhook or App private key.
+4. Under **Repository permissions**, set **Contents: Read and write**. **Metadata: Read-only** is supplied by GitHub. Leave unrelated permissions off. Editing workflow files requires GitHub's additional Workflows write permission; only enable it if your application needs that feature. Existing branch protections still apply.
+5. Allow installation on **Any account** if other users should connect repositories; choose **Only on this account** for a private personal tool. Create the App and generate a **client secret**. Copy its **Client ID** (not numeric App ID), secret, and the slug from `https://github.com/apps/YOUR-SLUG` into the backend environment below.
+6. Copy `.env.example` to `.env` for local work, or set these variables in Render for production. Keep your Groq key and generate one persistent application secret:
 
 ```sh
 python -c "import secrets; print(secrets.token_urlsafe(48))"
@@ -14,8 +17,9 @@ python -c "import secrets; print(secrets.token_urlsafe(48))"
 
 | Variable | Purpose |
 | --- | --- |
-| `GITHUB_CLIENT_ID` | GitHub OAuth App client ID. |
-| `GITHUB_CLIENT_SECRET` | OAuth client secret; backend only. |
+| `GITHUB_APP_SLUG` | Slug from the GitHub App public URL; required for repository selection links and installation verification. |
+| `GITHUB_CLIENT_ID` | GitHub App Client ID, not its numeric App ID and not an OAuth App client ID. |
+| `GITHUB_CLIENT_SECRET` | GitHub App client secret; backend only. |
 | `GITHUB_CALLBACK_URL` | Exact callback URL registered with GitHub. |
 | `SESSION_SECRET` | Persistent random value of at least 32 characters. Used for signed sessions, token encryption, and preview capabilities unless `APP_SECRET` is set. |
 | `APP_SECRET` | Optional override for `SESSION_SECRET`; when present it must also contain at least 32 characters. Keep the effective secret identical across API instances. |
@@ -33,9 +37,19 @@ pip install -r requirements.txt
 python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
 ```
 
-The API requires an effective secret of at least 32 characters to start. Keep it stable across restarts and deployments. Rotating it invalidates signed sessions and prevents decryption of saved OAuth credentials; users must authorize again. If OAuth credentials are missing, `GET /auth/session` reports `configured: false` and the frontend explains that sign-in is unavailable.
+The API requires an effective secret of at least 32 characters to start. Keep it stable across restarts and deployments. Rotating it invalidates signed sessions and prevents decryption of saved OAuth credentials; users must authorize again. If GitHub App credentials or the App slug are missing, `GET /auth/session` reports `configured: false` and the frontend explains that sign-in is unavailable.
 
-Authorization uses a browser-bound, single-use state and S256 PKCE. It requests GitHub's `repo` and `read:user` scopes. Organization OAuth restrictions and branch protections still apply.
+Authorization uses a browser-bound, single-use state and S256 PKCE. It requests no broad OAuth scopes. GitHub App user tokens are restricted by both the user's permissions and the App installation. RepoAgent additionally verifies installation membership before creating a job, before the worker clones, and again before approval pushes. A public repository outside the installation is also rejected. [GitHub documents App user authorization](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-user-access-token-for-a-github-app) and [installation repository access](https://docs.github.com/en/rest/apps/installations#list-repositories-accessible-to-the-user-access-token).
+
+### Choose repositories after deploying
+
+1. Deploy the backend first (startup adds the credential-binding columns), then the updated frontend. Configure API and workers with the same `GITHUB_CLIENT_ID`, `GITHUB_APP_SLUG`, and effective encryption secret (`APP_SECRET` or `SESSION_SECRET`). Workers do not need the client secret to use a stored user token.
+2. Sign in using **Continue with GitHub**. Existing broad OAuth sessions deliberately return `authenticated: false`; every user authorizes the new App once.
+3. Click **Choose repositories on GitHub**, select your account or organization, choose **Only select repositories**, pick the repositories, then **Install** or **Save**. Organization owners may need to approve installation.
+4. Return to RepoAgent and refresh repository access. Only App-authorized repositories with both Contents write and user push permission are offered. Use **Manage access** to add or remove repositories later. GitHub also allows an explicit **All repositories** installation; choose **Only select repositories** to restrict it.
+5. If migrating from the old OAuth integration, revoke its broad grant at **GitHub > Settings > Applications > Authorized OAuth Apps** after switching credentials. The migration does not revoke GitHub grants remotely. Do not revoke the newly authorized GitHub App.
+
+Tokens and sessions expire after at most eight hours; sign in again when asked. Refresh tokens are not stored. GitHub repository selections are fetched afresh, not persisted as a client-side allowlist. Removing a repository prevents future jobs and pushes, including pending jobs created before removal. Existing job history and diffs remain in the account for review.
 
 Use the matching pair of URLs for each deployment:
 
@@ -45,7 +59,7 @@ Use the matching pair of URLs for each deployment:
 | Production | `https://repoagent.onrender.com/auth/github/callback` | `https://repoagent-frontend.vercel.app` |
 
 Set production values in the Render service environment and register the matching
-callback with GitHub (use separate OAuth Apps for local and production if needed).
+callback with GitHub (use separate GitHub Apps for local and production if needed).
 Local `.env` edits do not update Render. Restart or redeploy after environment
 changes, then start a fresh login. An authorization URL containing a local callback
 means the backend that generated it is configured with the local callback value.
@@ -77,7 +91,7 @@ See [Render's database connection documentation](https://render.com/docs/postgre
 
 ## Sessions and frontend integration
 
-The signed, HttpOnly `repoagent_session` cookie contains an opaque session identifier and the internal user ID. The hashed session identifier resolves to the authoritative database session with a maximum lifetime of seven days, capped sooner when GitHub returns a shorter token expiry. HTTP development defaults to `SameSite=Lax`; HTTPS defaults to `SameSite=None; Secure`. Set `SESSION_SAME_SITE=none` in Render if overriding this default. Public user identity, expiry, and CSRF state live on the server. GitHub access tokens are stored as Fernet ciphertext in `users.access_token` and are never returned by the API.
+The signed, HttpOnly `repoagent_session` cookie contains an opaque session identifier and the internal user ID. The hashed session identifier resolves to the authoritative database session with a maximum lifetime of eight hours, capped sooner when GitHub returns a shorter token expiry. HTTP development defaults to `SameSite=Lax`; HTTPS defaults to `SameSite=None; Secure`. Set `SESSION_SAME_SITE=none` in Render if overriding this default. Public user identity, expiry, and CSRF state live on the server. GitHub access tokens are stored as Fernet ciphertext in `users.access_token` and are never returned by the API.
 
 Auth logs use `uvicorn.error.repoagent.auth` and record OAuth start, callback
 receipt, token exchange, user fetch, session creation, and the configured redirect
@@ -91,6 +105,7 @@ After `Session created`, check the next `Session checked` reason:
 - `cookie_missing`: no cookie arrived; check the browser's cookie rejection reason.
 - `cookie_invalid_or_expired`: a cookie arrived but could not be verified; check
   expiry and whether the signing secret changed between instances.
+- `github_app_reauthorization_required`: the credential predates selected access, belongs to another configured App, or expired; start a fresh GitHub sign-in.
 - `server_session_missing`, `server_session_expired`, or `user_missing`: the
   signed cookie was readable but its database session is no longer valid.
 
@@ -113,7 +128,7 @@ SESSION_SAME_SITE=none
 SESSION_HTTPS_ONLY=true
 ```
 
-Register that exact API callback in the GitHub OAuth App. The frontend should send credentials with every API request (`credentials: "include"` for Fetch or `withCredentials: true` for Axios), along with the CSRF header on POST requests. Invalid cookie policies and `SameSite=None` without secure cookies prevent startup, rather than silently creating a broken login. The short-lived OAuth flow cookie stays `SameSite=Lax` so the browser can send it on GitHub's top-level callback navigation.
+Register that exact API callback in the GitHub App. The frontend should send credentials with every API request (`credentials: "include"` for Fetch or `withCredentials: true` for Axios), along with the CSRF header on POST requests. Invalid cookie policies and `SameSite=None` without secure cookies prevent startup, rather than silently creating a broken login. The short-lived OAuth flow cookie stays `SameSite=Lax` so the browser can send it on GitHub's top-level callback navigation.
 
 Browsers can still block third-party cookies even with `SameSite=None; Secure`. Prefer a same-origin proxy when that restriction affects your users; CORS and cookie attributes cannot override browser privacy settings. See the [cookie attribute documentation](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Set-Cookie#samesitesamesite-value).
 
@@ -121,13 +136,13 @@ Browsers can still block third-party cookies even with `SameSite=None; Secure`. 
 | --- | --- |
 | `GET /auth/github/login` | Redirects the browser to GitHub authorization. |
 | `GET /auth/github/callback` | Exchanges the code, stores encrypted credentials, creates a database session, and redirects to `FRONTEND_URL`. |
-| `GET /auth/session` | `{ authenticated, configured, user, csrf_token? }`; user fields are `id` (GitHub ID), `login`, `name`, and `avatar_url`. |
+| `GET /auth/session` | `{ authenticated, configured, user, csrf_token?, repository_access }`; user fields are `id` (GitHub ID), `login`, `name`, and `avatar_url`. |
 | `GET /auth/me` | Compatibility response with internal `id`, `github_id`, `username`, `avatar_url`, and `csrf_token`; 401 when signed out. |
-| `GET /auth/repositories?page=1` | `{ repositories, has_more, next_page }`; entries include `id`, `full_name`, `clone_url`, `default_branch`, `private`, `description`, and `language`. |
+| `GET /auth/repositories?cursor=...` | `{ repositories, has_more, next_cursor, access }`; omit cursor initially. Entries include `id`, `full_name`, `clone_url`, `default_branch`, `private`, `description`, and `language`. |
 | `POST /auth/logout` | Records sign-out, deletes the database session, and clears the cookie. |
 | `GET /auth/activity?limit=20` | Newest account activity; `limit` accepts 1-50. Returns only the signed-in user's events. |
 
-Repository pages include accessible repositories with push permission, excluding archived and disabled repositories. The frontend searches the loaded list and requests more pages as needed. Users no longer submit PATs.
+Repository pages come from `/user/installations/{id}/repositories`, never the broad `/user/repos` endpoint. One page contains up to 100 repositories from one installation; follow the opaque `next_cursor` until null, including empty pages filtered by permissions. `access` contains `configured`, `installation_url`, `manage_url`, and `installations` (`id`, `account`, `repository_selection`, `manage_url`). Session `repository_access` contains the same configuration links without installation lookups. The API revalidates cursor installation IDs against the signed-in user's App installations. Suspended installations, archived/disabled repositories, read-only App installations, and repositories without user push permission are excluded.
 
 Create a job with the authenticated session and CSRF header:
 
@@ -166,7 +181,7 @@ The message is trimmed and must contain 1-200 characters on a single line, witho
 
 If an earlier push failed after creating the commit, retrying pushes that existing commit without rewriting it. The response always returns its actual message, even if the retry submits a different message. The API saves the actual commit message and `pushed_at` after a successful push and includes both in the approval response. Repeating an approval returns that saved result without another Git push. Simultaneous requests are serialized within the API process and, on PostgreSQL, with a database row lock across processes. Git and database writes cannot share a transaction: a crash after Git succeeds but before the database commit can still require a retry.
 
-Deploy the backend and frontend updates together; startup automatically applies the additive history migration described below. No new environment variables are required.
+Deploy the backend first, then the frontend; startup automatically applies the additive migrations. Configure the GitHub App credentials and GITHUB_APP_SLUG described above.
 
 ## Saved account activity
 
@@ -234,7 +249,7 @@ Job and preview background work is process-local. A restart can interrupt proces
 
 ## Existing databases
 
-Startup runs an idempotent, additive migration for PostgreSQL or SQLite. It creates missing user/session/OAuth/activity tables, adds `jobs.user_id` and its index plus `created_at`, `updated_at`, `pushed_at`, and `commit_message`, and preserves existing job IDs, diffs, statuses, and workspaces. New jobs receive timestamps; unknown historical dates and push state remain null. PostgreSQL schema changes are serialized across API instances.
+Startup runs an idempotent, additive migration for PostgreSQL or SQLite. It creates missing user/session/OAuth/activity tables, adds `jobs.user_id` and its index plus `created_at`, `updated_at`, `pushed_at`, and `commit_message`, adds nullable App client bindings on users/sessions and a token expiry on users, and preserves existing job IDs, diffs, statuses, and workspaces. New jobs receive timestamps; unknown historical dates and push state remain null. PostgreSQL schema changes are serialized across API instances.
 
 Legacy columns, including an old per-job PAT column if present, remain physically in the database but are no longer mapped by the ORM or returned by the API. This migration does not erase historical credentials; any data cleanup requires a separate deliberate migration.
 

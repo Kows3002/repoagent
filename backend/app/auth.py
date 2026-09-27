@@ -1,4 +1,4 @@
-"""GitHub OAuth, encrypted server-side credentials, and owned-job access."""
+"""GitHub App authorization, selected repository access, and owned-job access."""
 
 import base64
 import hashlib
@@ -30,7 +30,7 @@ router = APIRouter(prefix="/auth", tags=["Auth"])
 logger = logging.getLogger("uvicorn.error.repoagent.auth")
 SESSION_COOKIE = "repoagent_session"
 FLOW_COOKIE = "repoagent_oauth"
-SESSION_SECONDS = 7 * 24 * 60 * 60
+SESSION_SECONDS = 8 * 60 * 60
 FLOW_SECONDS = 10 * 60
 GITHUB_API = "https://api.github.com"
 REPO_PATTERN = re.compile(r"https://github\.com/([A-Za-z0-9-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?\Z")
@@ -57,6 +57,7 @@ def _valid_app_url(value: str) -> bool:
 def configured() -> bool:
     return bool(
         os.getenv("GITHUB_CLIENT_ID") and os.getenv("GITHUB_CLIENT_SECRET")
+        and re.fullmatch(r"[a-z0-9][a-z0-9-]{0,99}", os.getenv("GITHUB_APP_SLUG", ""))
         and len(application_secret()) >= 32
         and _valid_app_url(os.getenv("GITHUB_CALLBACK_URL", "").strip())
         and _valid_app_url(os.getenv("FRONTEND_URL", "").strip())
@@ -110,7 +111,9 @@ def decrypt_token(encrypted: str) -> str:
 def token_for_job(job: Job) -> str:
     if not job.user_id or job.user is None:
         raise HTTPException(status_code=401, detail="Please create a new job after signing in with GitHub.")
-    return decrypt_token(job.user.access_token)
+    token = _user_token(job.user)
+    _repository_with_token(job.repo_url, token)
+    return token
 
 
 def _secure_cookie() -> bool:
@@ -146,6 +149,10 @@ def _lookup_session(request: Request, db: Session) -> AuthSession | None:
         return None
     current = db.get(AuthSession, _digest(cookie))
     if current and current.expires_at > int(time.time()) and current.user is not None:
+        if (current.github_app_client_id != os.getenv("GITHUB_CLIENT_ID")
+                or not _current_app_credential(current.user)):
+            request.state.auth_session_reason = "github_app_reauthorization_required"
+            return None
         request.state.auth_session_reason = "authenticated"
         return current
     request.state.auth_session_reason = (
@@ -211,17 +218,109 @@ def github_request(path: str, token: str, params: dict | None = None) -> httpx.R
     return response
 
 
-def repository_for_job(repo_url: str, current: AuthSession) -> dict:
+def repository_access() -> dict:
+    ready = configured()
+    return {
+        "configured": ready,
+        "installation_url": f"https://github.com/apps/{os.environ['GITHUB_APP_SLUG']}/installations/new" if ready else None,
+        "manage_url": "https://github.com/settings/installations",
+    }
+
+
+def _current_app_credential(user: User) -> bool:
+    return bool(re.fullmatch(r"[a-z0-9][a-z0-9-]{0,99}", os.getenv("GITHUB_APP_SLUG", ""))
+                and os.getenv("GITHUB_CLIENT_ID") and len(application_secret()) >= 32
+                and user.github_app_client_id == os.getenv("GITHUB_CLIENT_ID")
+                and user.github_token_expires_at and user.github_token_expires_at > int(time.time()))
+
+
+def _user_token(user: User) -> str:
+    if not _current_app_credential(user):
+        raise HTTPException(status_code=401, detail="Sign in with GitHub again to choose repository access.")
+    token = decrypt_token(user.access_token)
+    if not token.startswith("ghu_"):
+        raise HTTPException(status_code=401, detail="Sign in with GitHub again to choose repository access.")
+    return token
+
+
+def _github_collection(response: httpx.Response, key: str) -> list[dict]:
+    try:
+        data = response.json()
+        items = data[key]
+        if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
+            raise ValueError()
+        return items
+    except (ValueError, KeyError, TypeError):
+        raise HTTPException(status_code=502, detail="GitHub returned an unavailable repository list. Please try again.") from None
+
+
+def _installations(token: str) -> list[dict]:
+    installations = []
+    for page in range(1, 10001):
+        result = github_request("/user/installations", token, {"per_page": 100, "page": page})
+        for item in _github_collection(result, "installations"):
+            # The endpoint is scoped to the authorizing App. Check the configured
+            # slug too, so mismatched operator credentials fail closed.
+            if (item.get("app_slug") == os.environ["GITHUB_APP_SLUG"]
+                    and isinstance(item.get("id"), int) and item["id"] > 0
+                    and not item.get("suspended_at")):
+                installations.append(item)
+        if "next" not in result.links:
+            return sorted(installations, key=lambda item: item["id"])
+    raise HTTPException(status_code=502, detail="GitHub returned too many installation pages. Please try again.")
+
+
+def _installation_summary(item: dict) -> dict:
+    account = item.get("account", {})
+    login = account.get("login", "")
+    management = f"https://github.com/settings/installations/{item['id']}"
+    if account.get("type") == "Organization" and re.fullmatch(r"[A-Za-z0-9-]+", login):
+        management = f"https://github.com/organizations/{login}/settings/installations/{item['id']}"
+    return {"id": item["id"], "account": login,
+            "repository_selection": item.get("repository_selection", "selected"), "manage_url": management}
+
+
+def _repository_page(installation: dict, token: str, page: int):
+    result = github_request(f"/user/installations/{installation['id']}/repositories", token,
+                            {"per_page": 100, "page": page})
+    repos = _github_collection(result, "repositories")
+    # User push permission alone is insufficient: the App must also have write.
+    writable = installation.get("permissions", {}).get("contents") == "write"
+    return ([repo for repo in repos if writable and repo.get("permissions", {}).get("push")
+             and not repo.get("archived") and not repo.get("disabled")
+             and REPO_PATTERN.fullmatch(repo.get("clone_url", ""))], "next" in result.links)
+
+
+def _repository_with_token(repo_url: str, token: str) -> dict:
     match = REPO_PATTERN.fullmatch(repo_url)
     if not match or match.group(2) in (".", ".."):
         raise HTTPException(status_code=422, detail="Choose a valid GitHub repository.")
     owner, name = match.groups()
-    repository = github_request(f"/repos/{owner}/{name}", decrypt_token(current.user.access_token)).json()
-    if repository.get("archived") or repository.get("disabled") or not repository.get("permissions", {}).get("push"):
-        raise HTTPException(status_code=403, detail="Choose a repository where you have permission to push changes.")
-    if not REPO_PATTERN.fullmatch(repository.get("clone_url", "")):
-        raise HTTPException(status_code=502, detail="GitHub returned an unavailable repository. Please try again.")
-    return repository
+    full_name = f"{owner}/{name}".lower()
+    # App tokens can read public metadata outside an installation. Listing the
+    # installation repositories, rather than GET /repos, proves explicit access.
+    for installation in _installations(token):
+        if installation.get("account", {}).get("login", "").lower() != owner.lower():
+            continue
+        if installation.get("permissions", {}).get("contents") != "write":
+            continue
+        for page in range(1, 10001):
+            repositories, has_more = _repository_page(installation, token, page)
+            for repository in repositories:
+                if repository.get("full_name", "").lower() == full_name:
+                    return repository
+            if not has_more:
+                break
+        else:
+            raise HTTPException(status_code=502, detail="GitHub returned too many repository pages. Please try again.")
+    raise HTTPException(status_code=403, detail="Choose this repository in your GitHub App installation and allow Contents read and write access.")
+
+
+def repository_for_job(repo_url: str, current: AuthSession) -> dict:
+    # Validate before reaching GitHub even when a client bypasses the picker.
+    if not REPO_PATTERN.fullmatch(repo_url):
+        raise HTTPException(status_code=422, detail="Choose a valid GitHub repository.")
+    return _repository_with_token(repo_url, _user_token(current.user))
 
 
 class SessionUser(BaseModel):
@@ -240,6 +339,7 @@ class SessionResponse(BaseModel):
     user: SessionUser | None
     configured: bool
     csrf_token: str | None = None
+    repository_access: dict
 
 
 @router.get("/session", response_model=SessionResponse, response_model_exclude_unset=True)
@@ -253,9 +353,9 @@ def session_status(request: Request, response: Response, db: Session = Depends(g
     logger.info("Session checked: authenticated=%s reason=%s", bool(current), request.state.auth_session_reason)
     ready = configured()
     if not current:
-        return {"authenticated": False, "configured": ready, "user": None}
+        return {"authenticated": False, "configured": ready, "user": None, "repository_access": repository_access()}
     return {
-        "authenticated": True, "configured": ready,
+        "authenticated": True, "configured": ready, "repository_access": repository_access(),
         "user": {"id": int(current.github_user_id), "username": current.user.username,
                  "avatar_url": current.avatar_url, "login": current.login,
                  "name": current.name, "user_id": current.user_id,
@@ -290,7 +390,7 @@ def github_login(db: Session = Depends(get_db)):
     db.commit()
     query = urlencode({"client_id": os.environ["GITHUB_CLIENT_ID"],
                        "redirect_uri": _oauth_url("GITHUB_CALLBACK_URL"),
-                       "scope": "repo read:user", "state": state,
+                       "state": state,
                        "code_challenge": challenge, "code_challenge_method": "S256"})
     response = RedirectResponse("https://github.com/login/oauth/authorize?" + query, status_code=302)
     response.headers["Cache-Control"] = "no-store"
@@ -337,7 +437,8 @@ def github_callback(request: Request, code: str = "", state: str = "", error: st
         exchanged.raise_for_status()
         token_data = exchanged.json()
         token = token_data.get("access_token")
-        if not isinstance(token, str) or not token or token_data.get("error"):
+        if (not isinstance(token, str) or not token.startswith("ghu_")
+                or token_data.get("scope") or token_data.get("error")):
             logger.warning("OAuth callback failed: stage=token_exchange reason=invalid_token_response")
             return _frontend_redirect("sign_in_failed")
         logger.info("Token exchanged")
@@ -357,11 +458,15 @@ def github_callback(request: Request, code: str = "", state: str = "", error: st
         account.username = user["login"]
         account.avatar_url = user.get("avatar_url")
         account.access_token = encrypt_token(token)
+        account.github_app_client_id = os.environ["GITHUB_CLIENT_ID"]
+        expires_at = int(time.time()) + lifetime
+        account.github_token_expires_at = expires_at
         db.flush()
         current = AuthSession(
             id=_digest(session_cookie), user_id=account.id,
             name=user.get("name"), csrf_token=secrets.token_urlsafe(32),
-            expires_at=int(time.time()) + lifetime,
+            github_app_client_id=os.environ["GITHUB_CLIENT_ID"],
+            expires_at=expires_at,
         )
         previous = _lookup_session(request, db)
         if previous:
@@ -394,18 +499,31 @@ def logout(request: Request, response: Response, current: AuthSession = Depends(
 
 
 @router.get("/repositories")
-def repositories(response: Response, page: int = Query(1, ge=1, le=10000),
+def repositories(response: Response, cursor: str | None = Query(None, max_length=32),
                  current: AuthSession = Depends(get_current_session)):
     response.headers["Cache-Control"] = "no-store"
-    result = github_request("/user/repos", decrypt_token(current.user.access_token),
-                            {"per_page": 100, "page": page, "sort": "pushed", "direction": "desc",
-                             "affiliation": "owner,collaborator,organization_member"})
+    token = _user_token(current.user)
+    installations = _installations(token)
+    access = {**repository_access(), "installations": [_installation_summary(item) for item in installations]}
+    if not installations:
+        return {"repositories": [], "has_more": False, "next_cursor": None, "access": access}
+    index, page = 0, 1
+    if cursor is not None:
+        match = re.fullmatch(r"([1-9][0-9]{0,19}):([1-9][0-9]{0,4})", cursor)
+        if not match or int(match.group(2)) > 10000:
+            raise HTTPException(status_code=422, detail="Refresh the repository list to continue.")
+        installation_id, page = map(int, match.groups())
+        index = next((i for i, item in enumerate(installations) if item["id"] == installation_id), -1)
+        if index < 0:
+            raise HTTPException(status_code=403, detail="Repository access changed. Refresh the repository list.")
+    available, has_more = _repository_page(installations[index], token, page)
+    if has_more and page == 10000:
+        raise HTTPException(status_code=502, detail="GitHub returned too many repository pages. Please try again.")
+    next_cursor = (f"{installations[index]['id']}:{page + 1}" if has_more else
+                   f"{installations[index + 1]['id']}:1" if index + 1 < len(installations) else None)
     keys = ("id", "full_name", "clone_url", "default_branch", "private", "description", "language")
-    available = [{key: repository.get(key) for key in keys} for repository in result.json()
-                 if repository.get("permissions", {}).get("push")
-                 and not repository.get("archived") and not repository.get("disabled")]
-    has_more = "next" in result.links
-    return {"repositories": available, "has_more": has_more, "next_page": page + 1 if has_more else None}
+    return {"repositories": [{key: repo.get(key) for key in keys} for repo in available],
+            "has_more": next_cursor is not None, "next_cursor": next_cursor, "access": access}
 
 
 @router.get("/activity", response_model=list[ActivityResponse])

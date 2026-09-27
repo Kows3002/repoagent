@@ -1,6 +1,8 @@
 import asyncio
 from pathlib import Path
 
+from fastapi import HTTPException
+
 from app.activity import record_activity
 from app.database import SessionLocal
 from app.models import Job
@@ -27,6 +29,10 @@ def run_job(job_id: int):
 def _friendly_error(error: Exception) -> str:
     if isinstance(error, GitCloneError):
         return str(error)
+    if isinstance(error, HTTPException) and error.status_code == 401:
+        return "Your GitHub connection expired. Sign in again and create a new job."
+    if isinstance(error, HTTPException) and error.status_code == 403:
+        return "Repository access changed. Choose this repository in your GitHub App installation and allow write access."
     message = str(error).lower()
     if "couldn't locate the file" in message:
         return "AI couldn't locate the file. Include the exact file path in your task."

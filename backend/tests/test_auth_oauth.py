@@ -9,7 +9,7 @@ import secrets
 import sqlite3
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import call, patch
 from urllib.parse import parse_qs, urlsplit
 
 os.environ.setdefault("SESSION_SECRET", "test-session-secret-with-at-least-32-characters")
@@ -30,7 +30,7 @@ from app.git_push_service import DEFAULT_COMMIT_MESSAGE, PushResult
 from app.models import ActivityEvent, AuthSession, Job, OAuthFlow, User
 
 SECRET = "isolated-tests-session-secret-at-least-32-characters"
-TOKEN = "oauth-access-secret-for-tests-only"
+TOKEN = "ghu_app-access-secret-for-tests-only"
 ORIGIN = "http://127.0.0.1:5173"
 PROFILE = {"id": 2**40, "login": "octocat", "name": "Mona", "avatar_url": "https://avatars.githubusercontent.com/u/1"}
 REPOSITORY = {"id": 42, "full_name": "octocat/project", "clone_url": "https://github.com/octocat/project.git",
@@ -43,6 +43,7 @@ class OAuthAndOwnershipTests(unittest.TestCase):
         self.addCleanup(self.stack.close)
         self.stack.enter_context(patch.dict(os.environ, {
             "SESSION_SECRET": SECRET, "APP_SECRET": "",
+            "GITHUB_APP_SLUG": "repoagent-test",
             "GITHUB_CLIENT_ID": "oauth-client-id", "GITHUB_CLIENT_SECRET": "oauth-client-secret",
             "GITHUB_CALLBACK_URL": ORIGIN + "/auth/github/callback", "FRONTEND_URL": ORIGIN,
             "CORS_ORIGINS": ORIGIN, "SESSION_HTTPS_ONLY": "false",
@@ -85,7 +86,9 @@ class OAuthAndOwnershipTests(unittest.TestCase):
 
     def _seed_user(self, github_id=1, token=TOKEN):
         with self.db_factory() as db:
-            user = User(github_id=github_id, username=f"user-{github_id}", access_token=auth.encrypt_token(token))
+            user = User(github_id=github_id, username=f"user-{github_id}", access_token=auth.encrypt_token(token),
+                        github_app_client_id=os.environ["GITHUB_CLIENT_ID"],
+                        github_token_expires_at=int(time.time()) + 28800)
             db.add(user)
             db.commit()
             return user.id
@@ -94,6 +97,7 @@ class OAuthAndOwnershipTests(unittest.TestCase):
         opaque = secrets.token_urlsafe(48)
         with self.db_factory() as db:
             db.add(AuthSession(id=auth._digest(opaque), user_id=user_id, csrf_token="test-csrf",
+                               github_app_client_id=os.environ["GITHUB_CLIENT_ID"],
                                expires_at=expires_at or int(time.time()) + 3600))
             db.commit()
         encoded = base64.b64encode(json.dumps({"session_id": opaque}).encode())
@@ -103,6 +107,13 @@ class OAuthAndOwnershipTests(unittest.TestCase):
 
     def _headers(self):
         return {"Origin": ORIGIN, "X-CSRF-Token": self.client.get("/auth/session").json()["csrf_token"]}
+
+    def _github_repositories(self, repositories=None, *, next_page=False, installations=None):
+        installation = {"id": 7, "app_slug": "repoagent-test", "account": {"login": "octocat", "type": "User"},
+                        "permissions": {"contents": "write"}, "repository_selection": "selected"}
+        return [httpx.Response(200, json={"installations": installations if installations is not None else [installation]}),
+                httpx.Response(200, json={"repositories": [REPOSITORY] if repositories is None else repositories},
+                    headers={"Link": '<https://api.github.com/user/installations/7/repositories?page=2>; rel="next"'} if next_page else {})]
 
     def _seed_job(self, user_id=None):
         with self.db_factory() as db:
@@ -146,7 +157,7 @@ class OAuthAndOwnershipTests(unittest.TestCase):
         challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
         self.assertEqual(query["code_challenge"], [challenge])
         self.assertEqual(query["code_challenge_method"], ["S256"])
-        self.assertEqual(set(query["scope"][0].split()), {"repo", "read:user"})
+        self.assertNotIn("scope", query)
         self.assertNotIn("oauth-client-secret", response.headers["location"])
         self.assertIn("httponly", response.headers["set-cookie"].lower())
         self.assertIn("samesite=lax", response.headers["set-cookie"].lower())
@@ -301,12 +312,12 @@ class OAuthAndOwnershipTests(unittest.TestCase):
     def test_repeat_login_rotates_session_and_updates_same_account(self):
         self._finish_login()
         previous = self._session()["session_id"]
-        self._finish_login(profile={**PROFILE, "login": "renamed"}, token="new-secret")
+        self._finish_login(profile={**PROFILE, "login": "renamed"}, token="ghu_new-secret")
         self.assertNotEqual(previous, self._session()["session_id"])
         with self.db_factory() as db:
             user = db.query(User).one()
             self.assertEqual(user.username, "renamed")
-            self.assertEqual(auth.decrypt_token(user.access_token), "new-secret")
+            self.assertEqual(auth.decrypt_token(user.access_token), "ghu_new-secret")
             self.assertIsNone(db.get(AuthSession, auth._digest(previous)))
 
     def test_session_survives_new_app_instance_using_same_database_and_secret(self):
@@ -351,11 +362,12 @@ class OAuthAndOwnershipTests(unittest.TestCase):
     def test_creation_checks_repository_and_uses_session_owner(self):
         user_id = self._seed_user()
         self._set_session(user_id)
-        with patch.object(routes, "run_job") as run, patch.object(auth, "github_request", return_value=httpx.Response(200, json=REPOSITORY)) as github:
+        with patch.object(routes, "run_job") as run, patch.object(auth, "github_request", side_effect=self._github_repositories()) as github:
             response = self.client.post("/jobs", headers=self._headers(), json={"repo_url": REPOSITORY["clone_url"], "task": "Change title"})
         self.assertEqual(response.status_code, 202)
         run.assert_called_once_with(response.json()["id"])
-        github.assert_called_once_with("/repos/octocat/project", TOKEN)
+        github.assert_has_calls([call("/user/installations", TOKEN, {"per_page": 100, "page": 1}),
+                                 call("/user/installations/7/repositories", TOKEN, {"per_page": 100, "page": 1})])
         with self.db_factory() as db:
             self.assertEqual(db.get(Job, response.json()["id"]).user_id, user_id)
         self.assertNotIn(TOKEN, response.text)
@@ -363,7 +375,7 @@ class OAuthAndOwnershipTests(unittest.TestCase):
     def test_creation_rejects_repository_without_write_permission(self):
         self._set_session(self._seed_user())
         repository = {**REPOSITORY, "permissions": {"push": False}}
-        with patch.object(auth, "github_request", return_value=httpx.Response(200, json=repository)), patch.object(routes, "run_job") as run:
+        with patch.object(auth, "github_request", side_effect=self._github_repositories([repository])), patch.object(routes, "run_job") as run:
             response = self.client.post("/jobs", headers=self._headers(), json={"repo_url": REPOSITORY["clone_url"], "task": "Change title"})
         self.assertEqual(response.status_code, 403)
         run.assert_not_called()
@@ -383,18 +395,18 @@ class OAuthAndOwnershipTests(unittest.TestCase):
             push.assert_not_called()
 
     def test_approval_rechecks_permissions_and_decrypts_latest_token(self):
-        user_id = self._seed_user(token="old-token")
+        user_id = self._seed_user(token="ghu_old-token")
         job_id = self._seed_job(user_id)
         self._set_session(user_id)
         with self.db_factory() as db:
-            db.get(User, user_id).access_token = auth.encrypt_token("latest-token")
+            db.get(User, user_id).access_token = auth.encrypt_token("ghu_latest-token")
             db.commit()
-        with patch.object(auth, "github_request", return_value=httpx.Response(200, json=REPOSITORY)) as github, patch.object(routes, "commit_and_push", return_value=PushResult(DEFAULT_COMMIT_MESSAGE)) as push:
+        with patch.object(auth, "github_request", side_effect=self._github_repositories()) as github, patch.object(routes, "commit_and_push", return_value=PushResult(DEFAULT_COMMIT_MESSAGE)) as push:
             response = self.client.post(f"/jobs/{job_id}/approve", headers=self._headers())
         self.assertEqual(response.status_code, 200)
-        github.assert_called_once_with("/repos/octocat/project", "latest-token")
-        push.assert_called_once_with("isolated-workspace", "latest-token", DEFAULT_COMMIT_MESSAGE)
-        self.assertNotIn("latest-token", response.text)
+        self.assertTrue(all(item.args[1] == "ghu_latest-token" for item in github.call_args_list))
+        push.assert_called_once_with("isolated-workspace", "ghu_latest-token", DEFAULT_COMMIT_MESSAGE)
+        self.assertNotIn("ghu_latest-token", response.text)
 
     def test_mutations_require_both_trusted_origin_and_csrf(self):
         user_id = self._seed_user()
@@ -414,14 +426,179 @@ class OAuthAndOwnershipTests(unittest.TestCase):
     def test_repository_picker_filters_and_exposes_pagination_without_credentials(self):
         self._set_session(self._seed_user())
         payload = [REPOSITORY, {**REPOSITORY, "archived": True}, {**REPOSITORY, "permissions": {"push": False}}]
-        result = httpx.Response(200, json=payload, headers={"Link": '<https://api.github.com/user/repos?page=2>; rel="next"'})
-        with patch.object(auth, "github_request", return_value=result):
+        result = self._github_repositories(payload, next_page=True)
+        with patch.object(auth, "github_request", side_effect=result):
             response = self.client.get("/auth/repositories")
         self.assertEqual(len(response.json()["repositories"]), 1)
         self.assertTrue(response.json()["has_more"])
-        self.assertEqual(response.json()["next_page"], 2)
+        self.assertEqual(response.json()["next_cursor"], "7:2")
         self.assertNotIn("permissions", response.json()["repositories"][0])
         self.assertNotIn(TOKEN, response.text)
+
+    def test_legacy_oauth_session_is_signed_out_and_never_reused_by_worker(self):
+        user_id = self._seed_user()
+        job_id = self._seed_job(user_id)
+        self._set_session(user_id)
+        with self.db_factory() as db:
+            db.get(User, user_id).github_app_client_id = None
+            db.commit()
+        with patch.object(auth, "github_request") as github:
+            response = self.client.get("/auth/session")
+            self.assertEqual(response.status_code, 200)
+            self.assertFalse(response.json()["authenticated"])
+            self.assertEqual(self.client.get("/auth/repositories").status_code, 401)
+            with self.db_factory() as db, self.assertRaises(HTTPException) as failure:
+                auth.token_for_job(db.get(Job, job_id))
+            self.assertEqual(failure.exception.status_code, 401)
+            github.assert_not_called()
+
+    def test_old_session_stays_invalid_after_user_reauthorizes(self):
+        user_id = self._seed_user()
+        self._set_session(user_id)
+        with self.db_factory() as db:
+            db.query(AuthSession).one().github_app_client_id = None
+            db.commit()
+        self.assertFalse(self.client.get("/auth/session").json()["authenticated"])
+
+    def test_different_app_credentials_or_expired_token_require_reauthorization(self):
+        user_id = self._seed_user()
+        job_id = self._seed_job(user_id)
+        self._set_session(user_id)
+        with patch.dict(os.environ, {"GITHUB_CLIENT_ID": "different-app"}):
+            self.assertFalse(self.client.get("/auth/session").json()["authenticated"])
+        with self.db_factory() as db:
+            db.get(User, user_id).github_token_expires_at = int(time.time()) - 1
+            db.commit()
+            with self.assertRaises(HTTPException) as failure:
+                auth.token_for_job(db.get(Job, job_id))
+            self.assertEqual(failure.exception.status_code, 401)
+        self.assertFalse(self.client.get("/auth/session").json()["authenticated"])
+
+    def test_app_authorization_rejects_broad_oauth_token(self):
+        response, _, profile = self._finish_login(token="gho_legacy-broad-token")
+        self.assertIn("auth_error=sign_in_failed", response.headers["location"])
+        profile.assert_not_called()
+        self.assertFalse(self.client.get("/auth/session").json()["authenticated"])
+
+    def test_callback_rejects_nonempty_legacy_scopes_even_with_app_prefix(self):
+        state = self._begin_login()
+        with patch.object(auth.httpx, "post") as exchange, patch.object(auth.httpx, "get") as profile:
+            exchange.return_value = httpx.Response(200, json={"access_token": TOKEN, "scope": "repo"}, request=httpx.Request("POST", "https://github.com/login/oauth/access_token"))
+            response = self.client.get("/auth/github/callback", params={"state": state, "code": "one-time-code"})
+        self.assertIn("auth_error=sign_in_failed", response.headers["location"])
+        profile.assert_not_called()
+
+    def test_worker_repository_errors_are_safe_and_actionable(self):
+        from app.worker import _friendly_error
+        expired = _friendly_error(HTTPException(status_code=401, detail="private-token-detail"))
+        denied = _friendly_error(HTTPException(status_code=403, detail="private-token-detail"))
+        self.assertIn("Sign in again", expired)
+        self.assertIn("GitHub App installation", denied)
+        self.assertNotIn("private-token-detail", expired + denied)
+
+    def test_session_and_stored_token_never_outlive_app_token(self):
+        self._finish_login(expires_in=120)
+        with self.db_factory() as db:
+            user = db.query(User).one()
+            session = db.query(AuthSession).one()
+            self.assertLessEqual(user.github_token_expires_at - int(time.time()), 120)
+            self.assertLessEqual(session.expires_at, user.github_token_expires_at)
+            self.assertEqual(user.github_app_client_id, session.github_app_client_id)
+
+    def test_missing_app_slug_has_no_oauth_fallback(self):
+        with patch.dict(os.environ, {"GITHUB_APP_SLUG": ""}), patch.object(auth, "github_request") as github:
+            session = self.client.get("/auth/session").json()
+            self.assertFalse(session["configured"])
+            self.assertIsNone(session["repository_access"]["installation_url"])
+            self.assertIn("auth_error=not_configured", self.client.get("/auth/github/login").headers["location"])
+            github.assert_not_called()
+
+    def test_no_installation_offers_github_repository_selection(self):
+        self._set_session(self._seed_user())
+        with patch.object(auth, "github_request", return_value=httpx.Response(200, json={"installations": []})) as github:
+            response = self.client.get("/auth/repositories")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["repositories"], [])
+        self.assertFalse(response.json()["has_more"])
+        self.assertEqual(response.json()["access"]["installation_url"], "https://github.com/apps/repoagent-test/installations/new")
+        self.assertEqual(github.call_count, 1)
+
+    def test_suspended_and_other_app_installations_are_excluded(self):
+        self._set_session(self._seed_user())
+        installations = [{"id": 1, "app_slug": "other-app"},
+                         {"id": 2, "app_slug": "repoagent-test", "suspended_at": "2026-01-01"}]
+        with patch.object(auth, "github_request", return_value=httpx.Response(200, json={"installations": installations})) as github:
+            response = self.client.get("/auth/repositories")
+        self.assertEqual(response.json()["repositories"], [])
+        self.assertEqual(response.json()["access"]["installations"], [])
+        self.assertEqual(github.call_count, 1)
+
+    def test_unselected_public_repository_is_denied_for_create_approve_and_worker(self):
+        user_id = self._seed_user()
+        self._set_session(user_id)
+        job_id = self._seed_job(user_id)
+        selected = {**REPOSITORY, "id": 43, "full_name": "octocat/selected", "clone_url": "https://github.com/octocat/selected.git"}
+        for endpoint in ("/jobs", f"/jobs/{job_id}/approve"):
+            with self.subTest(endpoint=endpoint), patch.object(auth, "github_request", side_effect=self._github_repositories([selected])), \
+                    patch.object(routes, "run_job") as run, patch.object(routes, "commit_and_push") as push:
+                response = self.client.post(endpoint, headers=self._headers(), json={"repo_url": REPOSITORY["clone_url"], "task": "Change title"} if endpoint == "/jobs" else {})
+                self.assertEqual(response.status_code, 403)
+                run.assert_not_called()
+                push.assert_not_called()
+        with self.db_factory() as db, patch.object(auth, "github_request", side_effect=self._github_repositories([selected])), self.assertRaises(HTTPException) as failure:
+            auth.token_for_job(db.get(Job, job_id))
+        self.assertEqual(failure.exception.status_code, 403)
+
+    def test_app_contents_read_only_blocks_repository_and_push(self):
+        self._set_session(self._seed_user())
+        installation = {"id": 7, "app_slug": "repoagent-test", "account": {"login": "octocat"}, "permissions": {"contents": "read"}}
+        with patch.object(auth, "github_request", side_effect=self._github_repositories(installations=[installation])):
+            self.assertEqual(self.client.get("/auth/repositories").json()["repositories"], [])
+        with patch.object(auth, "github_request", side_effect=self._github_repositories(installations=[installation])), patch.object(routes, "run_job") as run:
+            response = self.client.post("/jobs", headers=self._headers(), json={"repo_url": REPOSITORY["clone_url"], "task": "Change title"})
+            self.assertEqual(response.status_code, 403)
+            run.assert_not_called()
+
+    def test_repository_access_follows_installation_and_repository_pagination(self):
+        self._set_session(self._seed_user())
+        installation = {"id": 7, "app_slug": "repoagent-test", "account": {"login": "octocat"}, "permissions": {"contents": "write"}}
+        responses = [
+            httpx.Response(200, json={"installations": []}, headers={"Link": '<https://api.github.com/user/installations?page=2>; rel="next"'}),
+            httpx.Response(200, json={"installations": [installation]}),
+            httpx.Response(200, json={"repositories": []}, headers={"Link": '<https://api.github.com/user/installations/7/repositories?page=2>; rel="next"'}),
+            httpx.Response(200, json={"repositories": [REPOSITORY]}),
+        ]
+        with patch.object(auth, "github_request", side_effect=responses) as github, patch.object(routes, "run_job") as run:
+            response = self.client.post("/jobs", headers=self._headers(), json={"repo_url": REPOSITORY["clone_url"], "task": "Change title"})
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(github.call_args_list[1].args, ("/user/installations", TOKEN, {"per_page": 100, "page": 2}))
+        self.assertEqual(github.call_args_list[-1].args, ("/user/installations/7/repositories", TOKEN, {"per_page": 100, "page": 2}))
+        run.assert_called_once_with(response.json()["id"])
+
+    def test_unexpected_github_list_response_returns_safe_error(self):
+        self._set_session(self._seed_user())
+        with patch.object(auth, "github_request", return_value=httpx.Response(200, json={"private_detail": TOKEN})):
+            response = self.client.get("/auth/repositories")
+        self.assertEqual(response.status_code, 502)
+        self.assertNotIn(TOKEN, response.text)
+
+    def test_repository_cursor_pages_across_installations_and_rejects_forgery(self):
+        self._set_session(self._seed_user())
+        installations = [{"id": 7, "app_slug": "repoagent-test", "account": {"login": "octocat", "type": "User"}, "permissions": {"contents": "write"}},
+                         {"id": 9, "app_slug": "repoagent-test", "account": {"login": "team", "type": "Organization"}, "permissions": {"contents": "write"}}]
+        with patch.object(auth, "github_request", side_effect=self._github_repositories(installations=installations)):
+            response = self.client.get("/auth/repositories")
+            self.assertEqual(response.json()["next_cursor"], "9:1")
+            self.assertEqual(response.json()["access"]["installations"][1]["manage_url"], "https://github.com/organizations/team/settings/installations/9")
+        with patch.object(auth, "github_request", side_effect=self._github_repositories(installations=installations)) as github:
+            response = self.client.get("/auth/repositories?cursor=9:1")
+            self.assertEqual(response.status_code, 200)
+            self.assertIsNone(response.json()["next_cursor"])
+            self.assertEqual(github.call_args.args[0], "/user/installations/9/repositories")
+        for cursor, expected in (("999:1", 403), ("7:0", 422), ("7:10001", 422), ("../repos", 422)):
+            with self.subTest(cursor=cursor), patch.object(auth, "github_request", side_effect=self._github_repositories(installations=installations)) as github:
+                self.assertEqual(self.client.get("/auth/repositories", params={"cursor": cursor}).status_code, expected)
+                self.assertEqual(github.call_count, 1)
 
     def test_jobs_reject_unsafe_urls_and_browser_credentials(self):
         self._set_session(self._seed_user())
@@ -439,7 +616,7 @@ class OAuthAndOwnershipTests(unittest.TestCase):
 
     def test_missing_oauth_config_returns_honest_setup_state(self):
         with patch.dict(os.environ, {"GITHUB_CLIENT_ID": ""}):
-            self.assertEqual(self.client.get("/auth/session").json(), {"authenticated": False, "configured": False, "user": None})
+            self.assertEqual(self.client.get("/auth/session").json(), {"authenticated": False, "configured": False, "user": None, "repository_access": auth.repository_access()})
             self.assertIn("auth_error=not_configured", self.client.get("/auth/github/login").headers["location"])
 
     def test_session_route_is_public_and_documented_under_auth(self):
@@ -472,7 +649,7 @@ class OAuthAndOwnershipTests(unittest.TestCase):
 
     def test_existing_session_does_not_depend_on_login_configuration(self):
         self._finish_login()
-        with patch.dict(os.environ, {"GITHUB_CLIENT_ID": ""}):
+        with patch.dict(os.environ, {"GITHUB_CLIENT_SECRET": ""}):
             payload = self.client.get("/auth/session").json()
         self.assertTrue(payload["authenticated"])
         self.assertEqual(payload["user"]["username"], PROFILE["login"])

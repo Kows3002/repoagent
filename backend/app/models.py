@@ -18,6 +18,9 @@ class User(Base):
     avatar_url = Column(String, nullable=True)
     # Fernet ciphertext; raw OAuth credentials are never stored or serialized.
     access_token = Column(Text, nullable=False)
+    # NULL marks a legacy broad OAuth credential; it must never be reused.
+    github_app_client_id = Column(String, nullable=True)
+    github_token_expires_at = Column(BigInteger, nullable=True)
 
     jobs = relationship("Job", back_populates="user")
 
@@ -67,6 +70,7 @@ class AuthSession(Base):
     user = relationship("User")
     name = Column(String, nullable=True)
     csrf_token = Column(String, nullable=False)
+    github_app_client_id = Column(String, nullable=True)
     expires_at = Column(Integer, nullable=False, index=True)
 
     @property
