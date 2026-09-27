@@ -29,7 +29,7 @@ class RoutesTests(unittest.TestCase):
         self.job = SimpleNamespace(
             id=42, status="completed", diff="-old\n+new", workspace_path="test-workspace",
             user_id=7, user=self.user, repo_url="https://github.com/example/project.git",
-            task="Change the title", ai_result=None,
+            task="Change the title", ai_result=None, pushed_at=None, commit_message=None,
         )
         self.db.query.return_value.filter.return_value.first.return_value = self.job
         permissions = patch.object(routes, "repository_for_job", return_value={"clone_url": self.job.repo_url})
@@ -95,6 +95,7 @@ class RoutesTests(unittest.TestCase):
     def test_approval_without_body_or_message_uses_default(self):
         with self.approval_client() as client:
             for options in ({}, {"json": {}}, {"json": None}):
+                self.job.pushed_at = None
                 with self.subTest(options=options), patch.object(routes, "commit_and_push", return_value=PushResult(DEFAULT_COMMIT_MESSAGE)) as push:
                     response = client.post("/jobs/42/approve", **options)
                     self.assertEqual(response.status_code, 200)
@@ -106,7 +107,8 @@ class RoutesTests(unittest.TestCase):
         with self.approval_client() as client, patch.object(routes, "commit_and_push", return_value=PushResult(custom_message)) as push:
             response = client.post("/jobs/42/approve", json={"commit_message": "  " + custom_message + "  "})
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), {"message": "Changes pushed successfully", "job_id": 42, "commit_message": custom_message})
+        self.assertEqual(response.json()["commit_message"], custom_message)
+        self.assertIsInstance(response.json()["pushed_at"], int)
         push.assert_called_once_with("test-workspace", self.user.access_token, custom_message)
 
     def test_approval_reports_actual_message_when_retry_requests_another(self):
@@ -151,7 +153,7 @@ class WorkerTests(unittest.TestCase):
         self.addCleanup(snapshot.stop)
         self.job = SimpleNamespace(
             id=42, status="queued", workspace_id="test", repo_url="test-repo",
-            task="Update src/App.jsx", ai_result=None, diff=None,
+            task="Update src/App.jsx", ai_result=None, diff=None, user_id=7,
             user=SimpleNamespace(id=7, access_token="secret-token"),
         )
         self.db = MagicMock()

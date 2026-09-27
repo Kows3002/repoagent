@@ -1,4 +1,4 @@
-"""Small, idempotent startup migration for the OAuth schema.
+"""Small, idempotent startup migration for the OAuth and activity schema.
 
 Existing jobs keep their IDs, generated output, diffs and workspaces. Jobs from
 before OAuth have no trustworthy owner, so their user_id stays NULL and the API
@@ -38,6 +38,17 @@ def initialize_database(engine):
                 "ALTER TABLE jobs ADD COLUMN user_id INTEGER REFERENCES users(id)"
             ))
 
+        additions = {
+            "created_at": "BIGINT",
+            "updated_at": "BIGINT",
+            "pushed_at": "BIGINT",
+            "commit_message": "TEXT",
+        }
+        for name, column_type in additions.items():
+            if name not in columns:
+                connection.execute(text(f"ALTER TABLE jobs ADD COLUMN {name} {column_type}"))
+
+        # Historical creation/push times are unknown and intentionally stay NULL.
         # Leave legacy columns untouched. They are not mapped by the ORM and
         # cannot be returned by the authenticated API; historical jobs have no
         # established owner. Data cleanup requires a separate explicit migration.

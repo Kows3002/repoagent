@@ -1,7 +1,12 @@
 from sqlalchemy import BigInteger, Column, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import relationship
 from app.database import Base
+import time
 import uuid
+
+
+def utc_timestamp():
+    return int(time.time())
 
 
 class User(Base):
@@ -46,6 +51,12 @@ class Job(Base):
     ai_result = Column(Text, nullable=True)
     diff = Column(Text, nullable=True)
 
+    # Dates for legacy jobs remain unknown; new jobs always receive timestamps.
+    created_at = Column(BigInteger, default=utc_timestamp, nullable=True)
+    updated_at = Column(BigInteger, default=utc_timestamp, onupdate=utc_timestamp, nullable=True)
+    pushed_at = Column(BigInteger, nullable=True)
+    commit_message = Column(Text, nullable=True)
+
 
 class AuthSession(Base):
     __tablename__ = "auth_sessions"
@@ -78,3 +89,14 @@ class OAuthFlow(Base):
     browser_nonce_hash = Column(String, nullable=False)
     verifier_encrypted = Column(Text, nullable=False)
     expires_at = Column(Integer, nullable=False, index=True)
+
+
+class ActivityEvent(Base):
+    __tablename__ = "activity_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    job_id = Column(Integer, ForeignKey("jobs.id"), nullable=True)
+    kind = Column(String(40), nullable=False)
+    message = Column(String(200), nullable=False)
+    created_at = Column(BigInteger, default=utc_timestamp, nullable=False)

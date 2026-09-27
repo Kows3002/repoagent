@@ -19,8 +19,10 @@ from pydantic import BaseModel
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from app.activity import record_activity
 from app.database import get_db
-from app.models import AuthSession, Job, OAuthFlow, User
+from app.models import ActivityEvent, AuthSession, Job, OAuthFlow, User
+from app.schemas import ActivityResponse
 
 load_dotenv()
 
@@ -365,6 +367,7 @@ def github_callback(request: Request, code: str = "", state: str = "", error: st
         if previous:
             db.delete(previous)
         db.add(current)
+        record_activity(db, account.id, "login")
         db.commit()
         account_id = account.id
     except (httpx.HTTPError, HTTPException, SQLAlchemyError, ValueError, TypeError, KeyError, AttributeError) as failure:
@@ -382,6 +385,7 @@ def github_callback(request: Request, code: str = "", state: str = "", error: st
 
 @router.post("/logout")
 def logout(request: Request, response: Response, current: AuthSession = Depends(require_csrf), db: Session = Depends(get_db)):
+    record_activity(db, current.user_id, "logout")
     db.delete(current)
     db.commit()
     request.session.clear()
@@ -402,3 +406,15 @@ def repositories(response: Response, page: int = Query(1, ge=1, le=10000),
                  and not repository.get("archived") and not repository.get("disabled")]
     has_more = "next" in result.links
     return {"repositories": available, "has_more": has_more, "next_page": page + 1 if has_more else None}
+
+
+@router.get("/activity", response_model=list[ActivityResponse])
+def account_activity(
+    response: Response, limit: int = Query(20, ge=1, le=50),
+    db: Session = Depends(get_db), current: AuthSession = Depends(get_current_session),
+):
+    response.headers["Cache-Control"] = "no-store"
+    return (db.query(ActivityEvent)
+            .filter(ActivityEvent.user_id == current.user_id)
+            .order_by(ActivityEvent.created_at.desc(), ActivityEvent.id.desc())
+            .limit(limit).all())

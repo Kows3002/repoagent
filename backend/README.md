@@ -1,6 +1,6 @@
 ﻿# RepoAgent backend
 
-RepoAgent uses GitHub OAuth to connect an account, lists repositories the account can push to, and generates focused code changes. Users review the git diff and, for supported projects, real before-and-after UI previews. Explicit approval commits with `RepoAgent: Apply requested changes` and pushes directly to the repository's default branch. It does not create a branch or pull request.
+RepoAgent uses GitHub OAuth to connect an account, lists repositories the account can push to, and generates focused code changes. Users review the git diff and, for supported projects, real before-and-after UI previews. Explicit approval commits with the editable message (default: `RepoAgent: Apply requested changes`) and pushes directly to the repository's default branch. It does not create a branch or pull request.
 
 ## Configure GitHub sign-in
 
@@ -124,7 +124,8 @@ Browsers can still block third-party cookies even with `SameSite=None; Secure`. 
 | `GET /auth/session` | `{ authenticated, configured, user, csrf_token? }`; user fields are `id` (GitHub ID), `login`, `name`, and `avatar_url`. |
 | `GET /auth/me` | Compatibility response with internal `id`, `github_id`, `username`, `avatar_url`, and `csrf_token`; 401 when signed out. |
 | `GET /auth/repositories?page=1` | `{ repositories, has_more, next_page }`; entries include `id`, `full_name`, `clone_url`, `default_branch`, `private`, `description`, and `language`. |
-| `POST /auth/logout` | Deletes the database session and clears the cookie. |
+| `POST /auth/logout` | Records sign-out, deletes the database session, and clears the cookie. |
+| `GET /auth/activity?limit=20` | Newest account activity; `limit` accepts 1-50. Returns only the signed-in user's events. |
 
 Repository pages include accessible repositories with push permission, excluding archived and disabled repositories. The frontend searches the loaded list and requests more pages as needed. Users no longer submit PATs.
 
@@ -144,6 +145,8 @@ Origin: http://127.0.0.1:5173
 }
 ```
 
+`GET /jobs` returns the signed-in user's newest 50 jobs in descending ID order. Each job includes `created_at`, `updated_at`, `pushed_at`, and `commit_message`. Timestamps are UTC Unix seconds; `pushed_at` and `commit_message` are null until a successful approval. Historical jobs have null timestamps where the original time is unknown.
+
 The API responds with a queued job and runs cloning, analysis, and patch generation in a background thread. Poll `GET /jobs/{id}` for progress. `POST /jobs/{id}/approve` requires a completed job with changes and pushes to the current default branch. Protected branches may reject direct pushes. Each user can list, read, preview, and approve only their own jobs.
 
 Approval accepts an optional JSON body with the commit message edited in the review card. Send the session cookie, trusted Origin, and the same CSRF header as job creation:
@@ -161,7 +164,17 @@ Origin: http://127.0.0.1:5173
 
 The message is trimmed and must contain 1-200 characters on a single line, without control characters. Invalid messages return 422 before any commit or push. Omitting the body or the field keeps the default `RepoAgent: Apply requested changes`, so older clients remain compatible. A successful response contains `{ "message": "Changes pushed successfully", "job_id": 42, "commit_message": "Fix login page title" }`.
 
-If an earlier push failed after creating the commit, retrying pushes that existing commit without rewriting it. The response always returns its actual message, even if the retry submits a different message. Deploy the backend and frontend updates together; this change needs no database migration or new environment variables.
+If an earlier push failed after creating the commit, retrying pushes that existing commit without rewriting it. The response always returns its actual message, even if the retry submits a different message. The API saves the actual commit message and `pushed_at` after a successful push and includes both in the approval response. Repeating an approval returns that saved result without another Git push. Simultaneous requests are serialized within the API process and, on PostgreSQL, with a database row lock across processes. Git and database writes cannot share a transaction: a crash after Git succeeds but before the database commit can still require a retry.
+
+Deploy the backend and frontend updates together; startup automatically applies the additive history migration described below. No new environment variables are required.
+
+## Saved account activity
+
+Successful GitHub logins, sign-outs, job creation, generation completion/failure, and approved pushes are recorded in `activity_events` in the same database transaction as their saved application state. These summaries contain no tokens, request bodies, generated source, or exception details. Each event has `id`, `kind`, `message`, nullable `job_id`, and `created_at` (UTC Unix seconds). Kinds are `login`, `logout`, `job_created`, `job_completed`, `job_failed`, and `job_pushed`.
+
+`GET /auth/activity?limit=20` returns a JSON array, ordered newest first. It requires a signed-in session and returns only that account's activity; signing out does not delete the account's history. Opening the app again restores saved jobs and activity from the database. The activity log starts with this deployment; it does not invent events for earlier jobs or logins.
+
+Persist the configured database across deployments (managed PostgreSQL, or a persistent volume when using SQLite). Repository workspaces and preview artifacts still require their existing persistent storage to support later review and approval.
 
 ## Real UI previews
 
@@ -221,7 +234,7 @@ Job and preview background work is process-local. A restart can interrupt proces
 
 ## Existing databases
 
-Startup runs an idempotent, additive migration for PostgreSQL or SQLite. It creates missing user/session/OAuth tables, adds `jobs.user_id` and its index, and preserves existing job IDs, diffs, statuses, and workspaces. PostgreSQL schema changes are serialized across API instances.
+Startup runs an idempotent, additive migration for PostgreSQL or SQLite. It creates missing user/session/OAuth/activity tables, adds `jobs.user_id` and its index plus `created_at`, `updated_at`, `pushed_at`, and `commit_message`, and preserves existing job IDs, diffs, statuses, and workspaces. New jobs receive timestamps; unknown historical dates and push state remain null. PostgreSQL schema changes are serialized across API instances.
 
 Legacy columns, including an old per-job PAT column if present, remain physically in the database but are no longer mapped by the ORM or returned by the API. This migration does not erase historical credentials; any data cleanup requires a separate deliberate migration.
 

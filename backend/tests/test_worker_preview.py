@@ -15,7 +15,7 @@ class WorkerPreviewTests(unittest.TestCase):
             target = root / "src" / "App.jsx"
             target.parent.mkdir()
             target.write_text("original", encoding="utf-8")
-            job = SimpleNamespace(id=42, status="queued", workspace_id="preview-test", repo_url="https://github.com/example/project.git", task="Update src/App.jsx", ai_result=None, diff=None)
+            job = SimpleNamespace(id=42, user_id=7, status="queued", workspace_id="preview-test", repo_url="https://github.com/example/project.git", task="Update src/App.jsx", ai_result=None, diff=None)
             db = MagicMock()
             db.query.return_value.filter.return_value.first.return_value = job
             seen = []

@@ -27,7 +27,7 @@ from sqlalchemy.pool import StaticPool
 from app import auth, main, routes
 from app.database import Base, get_db
 from app.git_push_service import DEFAULT_COMMIT_MESSAGE, PushResult
-from app.models import AuthSession, Job, OAuthFlow, User
+from app.models import ActivityEvent, AuthSession, Job, OAuthFlow, User
 
 SECRET = "isolated-tests-session-secret-at-least-32-characters"
 TOKEN = "oauth-access-secret-for-tests-only"
@@ -111,6 +111,27 @@ class OAuthAndOwnershipTests(unittest.TestCase):
             db.add(job)
             db.commit()
             return job.id
+
+    def test_login_logout_activity_is_persistent_owned_and_secret_free(self):
+        response, _, _ = self._finish_login()
+        self.assertEqual(response.status_code, 303)
+        headers = self._headers()
+        activity = self.client.get("/auth/activity")
+        self.assertEqual(activity.status_code, 200)
+        self.assertEqual(activity.headers["cache-control"], "no-store")
+        self.assertEqual([event["kind"] for event in activity.json()], ["login"])
+        self.assertNotIn(TOKEN, activity.text)
+        self.assertEqual(self.client.post("/auth/logout", headers=headers).status_code, 200)
+        self.assertEqual(self.client.get("/auth/activity").status_code, 401)
+        with self.db_factory() as db:
+            events = db.query(ActivityEvent).order_by(ActivityEvent.id).all()
+            self.assertEqual([event.kind for event in events], ["login", "logout"])
+            owner = events[0].user_id
+        self._set_session(self._seed_user(github_id=987))
+        self.assertEqual(self.client.get("/auth/activity").json(), [])
+        self._set_session(owner)
+        self.assertEqual([event["kind"] for event in self.client.get("/auth/activity?limit=1").json()], ["logout"])
+        self.assertEqual(self.client.get("/auth/activity?limit=51").status_code, 422)
 
     def test_login_redirect_has_browser_bound_state_and_s256_pkce(self):
         response = self.client.get("/auth/github/login")

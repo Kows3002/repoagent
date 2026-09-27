@@ -49,3 +49,17 @@ class JobResponse(BaseModel):
     status: str
     ai_result: str | None = None
     diff: str | None = None
+    created_at: int | None = None
+    updated_at: int | None = None
+    pushed_at: int | None = None
+    commit_message: str | None = None
+
+
+class ActivityResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    kind: str
+    message: str
+    job_id: int | None = None
+    created_at: int

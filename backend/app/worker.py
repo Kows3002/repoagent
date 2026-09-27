@@ -1,6 +1,7 @@
 import asyncio
 from pathlib import Path
 
+from app.activity import record_activity
 from app.database import SessionLocal
 from app.models import Job
 
@@ -132,6 +133,7 @@ async def process_job(ctx, job_id: int):
             print(diff, flush=True)
 
         job.status = "completed"
+        record_activity(db, job.user_id, "job_completed", job.id)
         db.commit()
 
         print(f"\nCompleted Job {job_id}", flush=True)
@@ -144,6 +146,7 @@ async def process_job(ctx, job_id: int):
             db.rollback()
             job.status = "failed"
             job.ai_result = message
+            record_activity(db, job.user_id, "job_failed", job.id)
             db.commit()
 
     finally:

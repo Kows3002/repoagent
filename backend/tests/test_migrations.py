@@ -7,7 +7,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.migrations import initialize_database
-from app.models import Job, User
+from app.models import ActivityEvent, Job, User
 
 
 class MigrationTests(unittest.TestCase):
@@ -35,6 +35,8 @@ class MigrationTests(unittest.TestCase):
             self.assertEqual(restored.user.github_id, 2**40)
             self.assertEqual(restored.user.jobs, [restored])
             self.assertEqual(restored.user_id, user.id)
+            self.assertIsInstance(restored.created_at, int)
+            self.assertIsInstance(restored.updated_at, int)
 
     def test_legacy_upgrade_preserves_job_data_without_mapping_old_credentials(self):
         with self.engine.begin() as connection:
@@ -65,7 +67,7 @@ class MigrationTests(unittest.TestCase):
         columns = {column["name"] for column in inspect(self.engine).get_columns("jobs")}
         self.assertEqual(columns, set(Job.__table__.columns.keys()) | {"github_token"})
         self.assertNotIn("github_token", Job.__table__.columns.keys())
-        self.assertTrue({"auth_sessions", "oauth_flows"}.issubset(inspect(self.engine).get_table_names()))
+        self.assertTrue({"auth_sessions", "oauth_flows", "activity_events"}.issubset(inspect(self.engine).get_table_names()))
         with Session(self.engine) as db:
             job = db.get(Job, 42)
             self.assertEqual(job.workspace_id, "workspace-42")
@@ -75,6 +77,10 @@ class MigrationTests(unittest.TestCase):
             self.assertEqual(job.status, "completed")
             self.assertEqual(job.ai_result, "Generated result")
             self.assertEqual(job.diff, "-old\n+new")
+            self.assertIsNone(job.created_at)
+            self.assertIsNone(job.updated_at)
+            self.assertIsNone(job.pushed_at)
+            self.assertIsNone(job.commit_message)
             self.assertIsNone(job.user_id)
             self.assertIsNone(job.user)
             self.assertEqual(db.execute(text("SELECT github_token FROM jobs WHERE id = 42")).scalar_one(), "old-secret")
@@ -91,11 +97,19 @@ class MigrationTests(unittest.TestCase):
     def test_existing_owned_job_survives_repeated_startup(self):
         initialize_database(self.engine)
         with Session(self.engine) as db:
-            db.add(Job(id=7, user=User(github_id=1, username="octocat", access_token="oauth-secret")))
+            job = Job(id=7, user=User(github_id=1, username="octocat", access_token="oauth-secret"),
+                      created_at=100, updated_at=200, pushed_at=200, commit_message="Saved title")
+            db.add(job)
+            db.flush()
+            db.add(ActivityEvent(user_id=job.user_id, job_id=7, kind="job_pushed", message="Approved and pushed changes to GitHub.", created_at=200))
             db.commit()
         initialize_database(self.engine)
         with Session(self.engine) as db:
-            self.assertEqual(db.get(Job, 7).user.github_id, 1)
+            saved = db.get(Job, 7)
+            self.assertEqual(saved.user.github_id, 1)
+            self.assertEqual((saved.created_at, saved.updated_at, saved.pushed_at), (100, 200, 200))
+            self.assertEqual(saved.commit_message, "Saved title")
+            self.assertEqual(db.query(ActivityEvent).one().job_id, 7)
 
     def test_github_identity_is_unique(self):
         initialize_database(self.engine)
